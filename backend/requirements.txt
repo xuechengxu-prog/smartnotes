@@ -1,0 +1,35 @@
+# Web Framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.6
+
+# LangChain
+langchain>=0.1.0
+langchain-core>=0.1.0
+langchain-openai>=0.0.5
+
+# Database
+sqlalchemy>=2.0.0
+aiomysql>=0.2.0
+pymysql>=1.1.0
+cryptography>=42.0.0
+
+# Redis
+redis>=5.0.0
+
+# Authentication
+pyjwt>=2.8.0
+bcrypt>=4.1.0
+
+# HTTP Client
+httpx>=0.27.0
+
+# Data Validation
+pydantic>=2.6.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# ChromaDB
+chromadb>=0.4.0
+langchain-chroma>=0.1.0

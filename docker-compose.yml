@@ -1,0 +1,185 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: smartnotes-mysql
+    env_file:
+      - .env
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - default
+
+  redis:
+    image: redis:6.2-alpine
+    container_name: smartnotes-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - default
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: smartnotes-chroma
+    ports:
+      - "8005:8000"
+    volumes:
+      - chroma-data:/chroma/chroma_data
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma_data
+    networks:
+      - default
+
+  agent_note:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: smartnotes-agent_note
+    env_file:
+      - .env
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - REDIS_URL=redis://redis:6379/0
+    command: ["python", "-m", "uvicorn", "backend.agent_note.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8001:8001"
+    networks:
+      - default
+
+  agent_plan:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: smartnotes-agent_plan
+    env_file:
+      - .env
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - REDIS_URL=redis://redis:6379/0
+    command: ["python", "-m", "uvicorn", "backend.agent_plan.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8002:8002"
+    networks:
+      - default
+
+  agent_qa:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: smartnotes-agent_qa
+    env_file:
+      - .env
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - REDIS_URL=redis://redis:6379/0
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+    command: ["python", "-m", "uvicorn", "backend.agent_qa.main:app", "--host", "0.0.0.0", "--port", "8003"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      chromadb:
+        condition: service_started
+    ports:
+      - "8003:8003"
+    networks:
+      - default
+
+  gateway:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: smartnotes-gateway
+    env_file:
+      - .env
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - REDIS_URL=redis://redis:6379/0
+    command: ["python", "-m", "uvicorn", "backend.gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      agent_note:
+        condition: service_started
+      agent_plan:
+        condition: service_started
+      agent_qa:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    networks:
+      - default
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: smartnotes-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - gateway
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  chroma-data:
