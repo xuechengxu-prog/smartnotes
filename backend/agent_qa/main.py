@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from backend.agent_qa.agent_core import create_agent
-from backend.agent_qa.tools import AgentTools
+from backend.agent_qa.tools import AgentTools, TOOLS_DESCRIPTION
 from backend.chains.qa_chain import qa_chain
 from backend.common.redis_client import redis_client
 from backend.common.chroma_client import chroma_client
@@ -32,6 +32,7 @@ from backend.common.database import (
     init_database, close_database, get_db_session,
     KnowledgeItem,
 )
+from backend.rag.enhanced_rag import DataCleaner, SmartChunker
 from backend.config.settings import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -343,24 +344,33 @@ async def add_text_to_knowledge(
     request: KnowledgeAddTextRequest,
     x_user_id: int = Header(...),
 ):
-    """添加文本到知识库"""
+    """添加文本到知识库（增强版：数据清洗 + 智能切片）"""
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="文本内容不能为空")
 
     try:
         user_collection = _get_user_collection(x_user_id, request.collection_name)
-        paragraphs = [p.strip() for p in request.text.split('\n\n') if p.strip()]
-        if not paragraphs:
-            paragraphs = [request.text.strip()]
 
-        item_ids = [str(uuid.uuid4()) for _ in paragraphs]
-        metadatas = [{"user_id": str(x_user_id), "paragraph_index": i} for i in range(len(paragraphs))]
+        # Step 1: 数据清洗
+        cleaned_text = DataCleaner.clean_text(request.text)
+        if not cleaned_text.strip():
+            raise HTTPException(status_code=400, detail="清洗后文本内容为空，请提供更有实质内容的文本")
+
+        # Step 2: 智能切片
+        chunker = SmartChunker(chunk_size=500, chunk_overlap=50)
+        chunk_texts, chunk_metadatas = chunker.chunk_documents(
+            [cleaned_text],
+            [{"user_id": str(x_user_id), "source": "text_upload"}]
+        )
+
+        # Step 3: 批量入库
+        item_ids = [str(uuid.uuid4()) for _ in chunk_texts]
 
         try:
             chroma_client.add_texts(
                 collection_name=user_collection,
-                texts=paragraphs,
-                metadatas=metadatas,
+                texts=chunk_texts,
+                metadatas=chunk_metadatas,
                 ids=item_ids,
             )
         except Exception as e:
@@ -386,7 +396,7 @@ async def add_text_to_knowledge(
             await session.close()
 
         return {
-            "message": f"文本已添加到知识库（共 {len(paragraphs)} 个段落）",
+            "message": f"文本已添加到知识库（清洗后 {len(cleaned_text)} 字 -> {len(chunk_texts)} 个智能切片）",
             "chroma_ids": item_ids,
             "db_id": db_id,
             "collection_name": user_collection,
@@ -404,7 +414,7 @@ async def add_file_to_knowledge(
     collection_name: Optional[str] = Query(None, description="集合名称"),
     x_user_id: int = Header(...),
 ):
-    """上传文件到知识库"""
+    """上传文件到知识库（增强版：数据清洗 + 智能切片）"""
     try:
         content_bytes = await file.read()
         if not content_bytes:
@@ -413,20 +423,25 @@ async def add_file_to_knowledge(
         text_content = _parse_file_content(file.filename, content_bytes)
         user_collection = _get_user_collection(x_user_id, collection_name)
 
-        paragraphs = [p.strip() for p in text_content.split('\n\n') if p.strip()]
-        if not paragraphs:
-            paragraphs = [text_content.strip()]
+        # Step 1: 数据清洗
+        cleaned_text = DataCleaner.clean_text(text_content)
+        if not cleaned_text.strip():
+            raise HTTPException(status_code=400, detail="文件清洗后内容为空")
 
-        item_ids = [str(uuid.uuid4()) for _ in paragraphs]
-        metadatas = [
-            {"user_id": str(x_user_id), "filename": file.filename, "paragraph_index": i}
-            for i in range(len(paragraphs))
-        ]
+        # Step 2: 智能切片
+        chunker = SmartChunker(chunk_size=500, chunk_overlap=50)
+        chunk_texts, chunk_metadatas = chunker.chunk_documents(
+            [cleaned_text],
+            [{"user_id": str(x_user_id), "filename": file.filename, "source": "file_upload"}]
+        )
+
+        # Step 3: 批量入库
+        item_ids = [str(uuid.uuid4()) for _ in chunk_texts]
 
         chroma_client.add_texts(
             collection_name=user_collection,
-            texts=paragraphs,
-            metadatas=metadatas,
+            texts=chunk_texts,
+            metadatas=chunk_metadatas,
             ids=item_ids,
         )
 
@@ -435,7 +450,7 @@ async def add_file_to_knowledge(
             knowledge_item = KnowledgeItem(
                 user_id=x_user_id,
                 collection_name=user_collection,
-                content=text_content[:500] + ("..." if len(text_content) > 500 else ""),
+                content=cleaned_text[:500] + ("..." if len(cleaned_text) > 500 else ""),
                 filename=file.filename,
                 chroma_id=item_ids[0],
             )
@@ -450,7 +465,7 @@ async def add_file_to_knowledge(
             await session.close()
 
         return {
-            "message": f"文件 '{file.filename}' 已添加到知识库（共 {len(paragraphs)} 个段落）",
+            "message": f"文件 '{file.filename}' 已添加到知识库（清洗后 {len(cleaned_text)} 字 -> {len(chunk_texts)} 个智能切片）",
             "chroma_ids": item_ids,
             "db_id": db_id,
             "collection_name": user_collection,

@@ -1,8 +1,12 @@
 """
-Agent 工具集定义 v2.0
+Agent 工具集定义 v3.0
 为 ReAct Agent 提供可调用工具
-新增：query改写、BM25+语义多路召回、工具调用追踪
+v3.0 升级：
+- query_rewrite 从规则改写升级为 LLM Multi-Query + 指代消解
+- search_knowledge 接入 HybridRetriever（Multi-Query + HyDE + BM25 + RRF + MMR）
+- 知识库添加接入 DataCleaner + SmartChunker 智能切片
 """
+import asyncio
 import json
 import logging
 import re
@@ -10,10 +14,22 @@ import uuid
 from typing import Optional, List, Dict, Any, Tuple
 from collections import Counter
 
+# 允许在已有事件循环中嵌套运行异步代码（uvicorn + LangChain 同步工具调用场景）
+import nest_asyncio
+nest_asyncio.apply()
+
 from backend.common.chroma_client import chroma_client
 from backend.common.redis_client import redis_client
 from backend.services.llm_service import llm_service
 from backend.config.settings import settings
+from backend.rag.enhanced_rag import (
+    QueryRewriter,
+    DataCleaner,
+    SmartChunker,
+    HybridRetriever,
+)
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +99,8 @@ class AgentTools:
     def search_knowledge(user_id: int, query: str, collection_name: Optional[str] = None,
                          n_results: int = 5, session_id: Optional[str] = None) -> str:
         """
-        多路召回搜索用户知识库（BM25 + 语义检索）
+        企业级多路召回搜索用户知识库
+        使用 HybridRetriever 执行：Multi-Query改写 + 语义检索 + BM25 + RRF融合 + MMR重排
         :param user_id: 用户ID
         :param query: 搜索关键词/问题
         :param collection_name: 可选的集合名称
@@ -93,44 +110,19 @@ class AgentTools:
         """
         try:
             user_collection = AgentTools._get_user_collection(user_id, collection_name)
+            retriever = HybridRetriever()
 
-            # 1. 语义检索（向量相似度）- 失败时降级为纯 BM25
-            semantic_results = None
-            try:
-                semantic_results = chroma_client.search(
-                    collection_name=user_collection,
-                    query_text=query,
-                    n_results=n_results * 2,
-                )
-            except Exception as e:
-                logger.warning(f"Semantic search failed, falling back to BM25 only: {e}")
+            # 使用增强混合检索（同步版本，避免事件循环冲突）
+            result = retriever.retrieve_sync(
+                query=query,
+                collection_name=user_collection,
+                n_results=n_results,
+                use_multi_query=True,
+                use_hyde=False,
+                use_mmr=True,
+            )
 
-            # 2. 获取集合中所有文档用于 BM25
-            collection = chroma_client.get_or_create_collection(user_collection)
-            all_docs = collection.get()
-
-            # 3. BM25 关键词检索
-            query_tokens = AgentTools._tokenize(query)
-            bm25_scores = []
-            if all_docs and all_docs.get("documents"):
-                for i, doc in enumerate(all_docs["documents"]):
-                    if doc:
-                        score = AgentTools._bm25_score(query_tokens, doc)
-                        bm25_scores.append({
-                            "id": all_docs["ids"][i] if i < len(all_docs["ids"]) else str(i),
-                            "doc": doc,
-                            "score": score,
-                            "metadata": all_docs["metadatas"][i] if all_docs.get("metadatas") and i < len(all_docs["metadatas"]) else {}
-                        })
-
-            # 按 BM25 分数排序，取前 n_results*2
-            bm25_scores.sort(key=lambda x: x["score"], reverse=True)
-            bm25_top = bm25_scores[:n_results * 2]
-
-            # 4. 融合排序（RRF - Reciprocal Rank Fusion）
-            fused_results = AgentTools._rrf_fusion(semantic_results, bm25_top, n_results)
-
-            if not fused_results:
+            if not result or not result.get("results"):
                 result_text = "知识库中未找到相关内容。"
                 if session_id:
                     AgentTools.record_tool_call(session_id, "search_knowledge",
@@ -138,11 +130,13 @@ class AgentTools:
                 return result_text
 
             parts = []
-            for i, item in enumerate(fused_results[:n_results]):
+            for i, item in enumerate(result["results"][:n_results]):
                 source = item.get("metadata", {}).get("filename", f"文档{i+1}")
                 parts.append(f"[来源: {source}]\n{item['doc']}")
 
             result_text = "\n\n---\n\n".join(parts)
+            retrieval_type = result.get("retrieval_type", "unknown")
+            logger.info(f"知识库检索完成: type={retrieval_type}, results={len(parts)}")
 
             if session_id:
                 AgentTools.record_tool_call(session_id, "search_knowledge",
@@ -151,6 +145,31 @@ class AgentTools:
 
         except Exception as e:
             logger.error(f"Search knowledge failed: {e}")
+            # 降级：如果增强检索失败，回退到基础语义检索
+            logger.warning(f"增强检索失败，降级为基础检索: {e}")
+            try:
+                user_collection = AgentTools._get_user_collection(user_id, collection_name)
+                semantic_results = chroma_client.search(
+                    collection_name=user_collection,
+                    query_text=query,
+                    n_results=n_results,
+                )
+                if semantic_results and semantic_results.get("documents"):
+                    docs = semantic_results["documents"][0]
+                    metadatas = semantic_results.get("metadatas", [[]])[0]
+                    parts = []
+                    for i, doc in enumerate(docs[:n_results]):
+                        meta = metadatas[i] if i < len(metadatas) else {}
+                        source = meta.get("filename", f"文档{i+1}")
+                        parts.append(f"[来源: {source}]\n{doc}")
+                    result_text = "\n\n---\n\n".join(parts)
+                    if session_id:
+                        AgentTools.record_tool_call(session_id, "search_knowledge",
+                                                    {"query": query}, result_text)
+                    return result_text
+            except Exception as fallback_e:
+                logger.error(f"降级检索也失败: {fallback_e}")
+
             error_msg = f"搜索知识库时出错: {str(e)}"
             if session_id:
                 AgentTools.record_tool_call(session_id, "search_knowledge",
@@ -188,7 +207,8 @@ class AgentTools:
     def add_knowledge(user_id: int, text: str, collection_name: Optional[str] = None,
                       session_id: Optional[str] = None) -> str:
         """
-        添加知识到用户知识库
+        添加知识到用户知识库（增强版）
+        使用 DataCleaner 清洗 + SmartChunker 智能切片后批量入库
         :param user_id: 用户ID
         :param text: 要添加的知识文本
         :param collection_name: 可选的集合名称
@@ -203,15 +223,32 @@ class AgentTools:
                 return result
 
             user_collection = AgentTools._get_user_collection(user_id, collection_name)
-            item_id = str(uuid.uuid4())
 
+            # Step 1: 数据清洗
+            cleaned_text = DataCleaner.clean_text(text)
+            if not cleaned_text.strip():
+                result = "错误：清洗后内容为空，请提供更有实质内容的文本。"
+                if session_id:
+                    AgentTools.record_tool_call(session_id, "add_knowledge", {"text": text[:100]}, result)
+                return result
+
+            # Step 2: 智能切片
+            chunker = SmartChunker(chunk_size=500, chunk_overlap=50)
+            chunk_texts, chunk_metadatas = chunker.chunk_documents(
+                [cleaned_text],
+                [{"user_id": str(user_id), "type": "manual_add", "source": "agent_save"}]
+            )
+
+            # Step 3: 批量入库
+            chunk_ids = [str(uuid.uuid4()) for _ in chunk_texts]
             chroma_client.add_texts(
                 collection_name=user_collection,
-                texts=[text],
-                metadatas=[{"user_id": str(user_id), "type": "manual_add"}],
-                ids=[item_id],
+                texts=chunk_texts,
+                metadatas=chunk_metadatas,
+                ids=chunk_ids,
             )
-            result = f"知识已添加到知识库（collection: {user_collection}, id: {item_id}）"
+
+            result = f"知识已添加到知识库（collection: {user_collection}, 清洗后 {len(cleaned_text)} 字 -> {len(chunk_texts)} 个 chunk, ids: {chunk_ids[:3]}...）"
             if session_id:
                 AgentTools.record_tool_call(session_id, "add_knowledge",
                                             {"text": text[:100] + "..." if len(text) > 100 else text}, result)
@@ -226,29 +263,49 @@ class AgentTools:
     @staticmethod
     def query_rewrite(original_query: str, history: List[Dict[str, str]] = None) -> str:
         """
-        查询改写：将用户的模糊/指代性查询改写为独立完整的查询
+        查询改写 v2.0：结合指代消解 + LLM Multi-Query 生成更优查询
         :param original_query: 原始查询
         :param history: 历史对话（可选）
         :return: 改写后的查询
         """
-        # 简单规则改写（后续可接入 LLM 做更智能的改写）
         query = original_query.strip()
 
-        # 指代消解规则
+        # Step 1: 指代消解（保留规则引擎处理简单情况）
         pronouns = ["这个", "那个", "刚才", "之前", "上面", "这些", "那些"]
         has_pronoun = any(p in query for p in pronouns)
 
         if has_pronoun and history:
-            # 从历史中提取最近一条 assistant 回复的摘要
             for msg in reversed(history):
                 if msg.get("role") == "assistant":
                     content = msg.get("content", "")
-                    # 提取前 100 字作为上下文
                     context = content[:100] + "..." if len(content) > 100 else content
                     query = f"基于之前的讨论（{context}），用户问：{query}"
                     break
 
-        # 保存意图识别
+        # Step 2: LLM 查询优化（将模糊查询改写为更清晰的检索语句）
+        try:
+            rewrite_prompt = ChatPromptTemplate.from_messages([
+                ("human", """请将以下用户查询改写为更适合知识库检索的形式。
+规则：
+1. 补全省略的主语和上下文
+2. 将口语化表述转换为正式表述
+3. 提取核心关键词
+4. 只输出改写后的查询，不要解释
+5. 如果原始查询已经很清晰，保持不变
+
+原始查询: {query}
+改写后的查询:"""),
+            ])
+            from langchain_core.output_parsers import StrOutputParser
+            chain = rewrite_prompt | llm_service.llm | StrOutputParser()
+            rewritten = chain.invoke({"query": query})
+            if rewritten and rewritten.strip():
+                logger.info(f"Query rewrite (LLM): '{query}' -> '{rewritten.strip()}'")
+                return rewritten.strip()
+        except Exception as e:
+            logger.warning(f"LLM query rewrite failed, using rule-based result: {e}")
+
+        # Step 3: 保存意图识别
         save_keywords = ["保存", "记录", "存到", "存入", "加入知识库", "放进知识库"]
         if any(kw in query for kw in save_keywords):
             query = f"[保存意图] {query}"

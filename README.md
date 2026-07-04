@@ -7,6 +7,7 @@
 - **笔记整理 Agent** - 将原始笔记智能整理为结构化格式，支持自定义风格
 - **复习计划 Agent** - 基于艾宾浩斯遗忘曲线生成科学的复习计划
 - **问答 Agent (ReAct)** - 支持工具调用的智能问答，可检索个人知识库
+- **企业级 RAG 知识检索** - Query 改写、数据清洗、智能切片、混合召回、MMR 重排
 - **知识库管理** - 支持文本/文件上传，向量检索，用户数据隔离
 - **统一网关** - JWT 认证、Redis 滑动窗口限流、请求路由转发
 - **流式输出** - 所有 AI 功能均支持 SSE 流式响应
@@ -20,6 +21,7 @@
 | Web 框架 | FastAPI + Uvicorn |
 | AI 框架 | LangChain + LangChain-OpenAI |
 | LLM 服务 | 阿里云百炼 Qwen3.7-plus |
+| Embedding | 阿里云百炼 text-embedding-v3 |
 | 数据库 | MySQL 8.0 (SQLAlchemy 2.0 + aiomysql) |
 | 缓存/会话 | Redis 6.2 |
 | 向量数据库 | ChromaDB |
@@ -142,7 +144,11 @@ smartnotes/
 │   ├── common/               # 公共模块 (DB, Redis, JWT, Chroma)
 │   ├── config/               # 配置管理
 │   ├── gateway/              # 统一网关
-│   ├── rag/                  # RAG 相关模块
+│   ├── rag/                  # RAG 增强模块
+│   │   ├── enhanced_rag.py   # 查询改写/数据清洗/智能切片/混合检索
+│   │   ├── document_loader.py # 文档加载与预处理
+│   │   ├── retriever.py      # RAG 检索器
+│   │   └── knowledge_api.py   # 知识库 API
 │   ├── services/             # 业务服务层
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -229,6 +235,20 @@ smartnotes/
 基于 Redis 滑动窗口实现：
 - 已登录用户：按用户 ID 限流
 - 未登录用户：按 IP 限流
+
+### 企业级 RAG 增强检索
+
+问答 Agent 的知识库检索采用企业级 RAG 管道，覆盖从数据入库到检索生成的完整链路：
+
+**数据入库管道：**
+1. **数据清洗 (DataCleaner)** - 移除页眉页脚、过滤乱码/广告水印、连续段落去重
+2. **智能切片 (SmartChunker)** - 基于中文标点的递归字符分块，自动携带元数据
+
+**检索管道：**
+1. **Query 改写 (QueryRewriter)** - Multi-Query 多角度改写 / HyDE 假设文档嵌入 / Step-Back 后退提示
+2. **混合召回** - 语义向量检索 + BM25 关键词检索并行执行
+3. **RRF 融合排序** - Reciprocal Rank Fusion (k=60) 合并多路召回结果
+4. **MMR 多样性重排** - Maximal Marginal Relevance (lambda=0.55) 平衡相关性与多样性
 
 ## 开发指南
 
