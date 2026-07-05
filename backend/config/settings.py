@@ -54,6 +54,10 @@ class Settings:
     CHROMA_HOST: str = os.getenv("CHROMA_HOST", "localhost")
     CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8000"))
 
+    # MCP 配置
+    WEB_SEARCH_MCP_URL: str = os.getenv("WEB_SEARCH_MCP_URL", "http://localhost:8010/mcp")
+    SMARTNOTES_MCP_URL: str = os.getenv("SMARTNOTES_MCP_URL", "http://localhost:8011/mcp")
+
     # 服务地址配置
     AGENT_NOTE_HOST: str = os.getenv("AGENT_NOTE_HOST", "agent_note")
     AGENT_NOTE_PORT: int = int(os.getenv("AGENT_NOTE_PORT", "8001"))

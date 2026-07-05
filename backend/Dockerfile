@@ -34,6 +34,6 @@ ENV CURL_CA_BUNDLE=""
 ENV PYTHONHTTPSVERIFY=0
 ENV SSL_NO_VERIFY=1
 
-EXPOSE 8000 8001 8002 8003
+EXPOSE 8000 8001 8002 8003 8010 8011
 
 CMD ["uvicorn", "backend.gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]

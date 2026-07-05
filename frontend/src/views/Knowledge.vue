@@ -5,6 +5,58 @@
       <p class="subtitle">添加学习资料，AI 将基于知识库为你解答问题</p>
     </div>
 
+    <!-- 全局知识库选择器 -->
+    <div class="collection-selector-card">
+      <div class="selector-label">
+        <el-icon size="18"><Collection /></el-icon>
+        <span>当前知识库</span>
+      </div>
+      <el-select
+        v-model="currentCollection"
+        filterable
+        placeholder="选择知识库"
+        class="collection-selector"
+        @change="onCollectionChange"
+      >
+        <el-option
+          v-for="name in collections"
+          :key="name"
+          :label="name"
+          :value="name"
+        />
+      </el-select>
+      <el-button type="primary" plain @click="showCreateDialog = true">
+        <el-icon><Plus /></el-icon>
+        新建知识库
+      </el-button>
+      <span class="collection-count">共 {{ collections.length }} 个知识库</span>
+    </div>
+
+    <!-- 新建知识库弹窗 -->
+    <el-dialog
+      v-model="showCreateDialog"
+      title="新建知识库"
+      width="400px"
+      :close-on-click-modal="false"
+    >
+      <el-form :model="createForm" label-position="top">
+        <el-form-item label="知识库名称">
+          <el-input
+            v-model="createForm.collection_name"
+            placeholder="输入知识库名称，如：python_notes"
+            @keyup.enter="handleCreateCollection"
+          />
+          <div class="create-hint">只能包含字母、数字、下划线、中划线</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showCreateDialog = false">取消</el-button>
+        <el-button type="primary" :loading="creating" @click="handleCreateCollection">
+          创建
+        </el-button>
+      </template>
+    </el-dialog>
+
     <div class="add-section">
       <el-form :model="addForm" label-position="top" class="add-form">
         <el-form-item label="知识内容">
@@ -15,14 +67,10 @@
             placeholder="输入知识内容..."
           />
         </el-form-item>
-        <el-form-item label="知识库名称 (collection_name)">
-          <el-input v-model="addForm.collection_name" placeholder="输入 collection_name" />
-          <div class="collection-hint">只能使用字母、数字、下划线、中划线</div>
-        </el-form-item>
         <el-form-item>
-          <el-button type="primary" :loading="adding" :disabled="!addForm.content || !addForm.collection_name" @click="handleAdd">
+          <el-button type="primary" :loading="adding" :disabled="!addForm.content" @click="handleAdd">
             <el-icon class="btn-icon"><Plus /></el-icon>
-            添加
+            添加到 "{{ currentCollection || 'default' }}"
           </el-button>
         </el-form-item>
       </el-form>
@@ -32,7 +80,7 @@
         drag
         action="/api/knowledge/add/file"
         :headers="uploadHeaders"
-        :data="{ collection_name: addForm.collection_name }"
+        :data="{ collection_name: currentCollection }"
         :on-success="handleUploadSuccess"
         :on-error="handleUploadError"
         accept=".txt,.md"
@@ -43,7 +91,7 @@
         </div>
         <template #tip>
           <div class="el-upload__tip">
-            支持 .txt / .md 格式文件
+            文件将上传到 "{{ currentCollection || 'default' }}" 知识库
           </div>
         </template>
       </el-upload>
@@ -64,6 +112,18 @@
             </el-button>
           </template>
         </el-input>
+        <el-select
+          v-model="currentCollection"
+          placeholder="搜索范围"
+          class="search-collection-select"
+        >
+          <el-option
+            v-for="name in collections"
+            :key="name"
+            :label="name"
+            :value="name"
+          />
+        </el-select>
       </div>
 
       <div v-if="searching" class="search-loading">
@@ -105,16 +165,23 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Plus, UploadFilled, Search, Loading } from '@element-plus/icons-vue'
-import { addKnowledgeText, searchKnowledge } from '@/api/knowledge'
+import { Plus, UploadFilled, Search, Loading, Collection } from '@element-plus/icons-vue'
+import { addKnowledgeText, searchKnowledge, getCollections, createCollection } from '@/api/knowledge'
 
+const savedCollection = localStorage.getItem('knowledge_collection_name') || ''
+const currentCollection = ref(savedCollection)
 const addForm = ref({
   content: '',
-  collection_name: 'default',
 })
 const adding = ref(false)
+const collections = ref([])
+
+// 新建知识库弹窗
+const showCreateDialog = ref(false)
+const createForm = ref({ collection_name: '' })
+const creating = ref(false)
 
 const searchQuery = ref('')
 const searchResults = ref([])
@@ -126,25 +193,78 @@ const uploadHeaders = computed(() => ({
   Authorization: `Bearer ${token}`,
 }))
 
-const handleAdd = async () => {
-  if (!addForm.value.content || !addForm.value.collection_name) return
-  // 验证 collection_name 格式
-  const name = addForm.value.collection_name.trim()
-  const validNameRegex = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*[a-zA-Z0-9]$/
-  if (!validNameRegex.test(name)) {
-    ElMessage.error('知识库名称只能包含字母、数字、下划线、中划线，且不能以特殊字符开头或结尾')
+// 加载用户所有知识库
+const loadCollections = async () => {
+  try {
+    const res = await getCollections()
+    collections.value = res.collections || ['default']
+    // 如果当前选中的 collection 不在列表中，添加到列表
+    const current = addForm.value.collection_name.trim()
+    if (current && !collections.value.includes(current)) {
+      collections.value.push(current)
+    }
+  } catch (e) {
+    console.error('加载知识库列表失败:', e)
+  }
+}
+
+const onCollectionChange = (val) => {
+  if (val) {
+    localStorage.setItem('knowledge_collection_name', val)
+  }
+}
+
+const handleCreateCollection = async () => {
+  const name = createForm.value.collection_name.trim()
+  if (!name) {
+    ElMessage.warning('请输入知识库名称')
     return
+  }
+  creating.value = true
+  try {
+    const res = await createCollection({ collection_name: name })
+    ElMessage.success(res.message || '知识库创建成功')
+    // 刷新列表并自动选中新创建的知识库
+    await loadCollections()
+    currentCollection.value = name
+    localStorage.setItem('knowledge_collection_name', name)
+    showCreateDialog.value = false
+    createForm.value.collection_name = ''
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '创建失败')
+  } finally {
+    creating.value = false
+  }
+}
+
+const handleAdd = async () => {
+  if (!addForm.value.content) return
+  // 验证 collection_name 格式
+  const name = (currentCollection.value || '').trim()
+  if (name) {
+    const validNameRegex = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*[a-zA-Z0-9]$/
+    if (!validNameRegex.test(name)) {
+      ElMessage.error('知识库名称只能包含字母、数字、下划线、中划线，且不能以特殊字符开头或结尾')
+      return
+    }
   }
   adding.value = true
   try {
-    await addKnowledgeText({
+    const res = await addKnowledgeText({
       text: addForm.value.content,
-      collection_name: addForm.value.collection_name,
+      collection_name: name || 'default',
     })
-    ElMessage.success('知识添加成功')
+    if (res.duplicate) {
+      ElMessage.warning(res.message)
+    } else {
+      ElMessage.success('知识添加成功')
+    }
+    localStorage.setItem('knowledge_collection_name', name)
+    // 添加成功后刷新 collection 列表
+    await loadCollections()
     addForm.value.content = ''
   } catch (e) {
-    ElMessage.error(e.response?.data?.detail || '添加失败')
+    // 错误提示已在 request.js 拦截器中统一处理，这里不再重复
   } finally {
     adding.value = false
   }
@@ -152,6 +272,7 @@ const handleAdd = async () => {
 
 const handleUploadSuccess = () => {
   ElMessage.success('文件上传成功')
+  loadCollections()
 }
 
 const handleUploadError = (err) => {
@@ -168,11 +289,15 @@ const handleSearch = async () => {
   searching.value = true
   hasSearched.value = true
   try {
-    const res = await searchKnowledge({
+    const params = {
       query: searchQuery.value.trim(),
-      collection_name: addForm.value.collection_name,
       n_results: 5,
-    })
+    }
+    // 如果当前选中了特定知识库，只搜索该知识库；否则搜索全部
+    if (currentCollection.value) {
+      params.collection_name = currentCollection.value
+    }
+    const res = await searchKnowledge(params)
     searchResults.value = res.results || []
   } catch (e) {
     ElMessage.error(e.response?.data?.detail || '搜索失败')
@@ -181,6 +306,10 @@ const handleSearch = async () => {
     searching.value = false
   }
 }
+
+onMounted(() => {
+  loadCollections()
+})
 </script>
 
 <style scoped>
@@ -197,7 +326,7 @@ const handleSearch = async () => {
   font-size: 24px;
   font-weight: 600;
   margin: 0 0 8px 0;
-  background: linear-gradient(135deg, #00f0ff 0%, #7c3aed 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -209,6 +338,48 @@ const handleSearch = async () => {
   margin: 0;
 }
 
+.collection-selector-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 20px;
+  background: #ffffff;
+  border: 1px solid rgba(99, 102, 241, 0.12);
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+  margin-bottom: 24px;
+}
+
+.selector-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #1e293b;
+  font-weight: 500;
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+.collection-selector {
+  width: 240px;
+}
+
+.collection-selector :deep(.el-input__wrapper) {
+  background: #ffffff;
+}
+
+.collection-count {
+  color: rgba(148, 163, 184, 0.7);
+  font-size: 13px;
+  margin-left: auto;
+}
+
+.create-hint {
+  font-size: 12px;
+  color: rgba(148, 163, 184, 0.5);
+  margin-top: 4px;
+}
+
 .add-section {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -216,16 +387,28 @@ const handleSearch = async () => {
   margin-bottom: 32px;
 }
 
+.add-form :deep(.el-form) {
+  background: #ffffff;
+  padding: 20px;
+  border-radius: 16px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+}
+
+.upload-area :deep(.el-upload-dragger) {
+  background: #ffffff;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+}
+
 .add-form :deep(.el-form-item__label) {
-  color: #e2e8f0;
+  color: #1e293b;
   font-weight: 500;
 }
 
 .add-form :deep(.el-textarea__inner),
 .add-form :deep(.el-input__inner) {
-  background: rgba(30, 41, 59, 0.6);
+  background: #ffffff;
   border: 1px solid rgba(148, 163, 184, 0.2);
-  color: #e2e8f0;
+  color: #1e293b;
 }
 
 .add-form :deep(.el-textarea__inner::placeholder),
@@ -233,20 +416,14 @@ const handleSearch = async () => {
   color: rgba(148, 163, 184, 0.5);
 }
 
-.collection-hint {
-  font-size: 12px;
-  color: rgba(148, 163, 184, 0.5);
-  margin-top: 4px;
-}
-
 .upload-area :deep(.el-upload-dragger) {
-  background: rgba(30, 41, 59, 0.4);
-  border: 2px dashed rgba(0, 240, 255, 0.2);
+  background: #ffffff;
+  border: 2px dashed rgba(99, 102, 241, 0.2);
   border-radius: 12px;
 }
 
 .upload-area :deep(.el-upload-dragger:hover) {
-  border-color: rgba(0, 240, 255, 0.5);
+  border-color: rgba(99, 102, 241, 0.5);
 }
 
 .upload-area :deep(.el-upload__text) {
@@ -267,17 +444,32 @@ const handleSearch = async () => {
 
 .search-box {
   margin-bottom: 20px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.search-input {
+  flex: 1;
+}
+
+.search-collection-select {
+  width: 160px;
+}
+
+.search-collection-select :deep(.el-input__wrapper) {
+  background: #ffffff;
 }
 
 .search-input :deep(.el-input__inner) {
-  background: rgba(30, 41, 59, 0.6);
+  background: #ffffff;
   border: 1px solid rgba(148, 163, 184, 0.2);
-  color: #e2e8f0;
+  color: #1e293b;
   border-radius: 12px 0 0 12px;
 }
 
 .search-input :deep(.el-input-group__append) {
-  background: linear-gradient(135deg, #00f0ff 0%, #7c3aed 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   border: none;
 }
 
@@ -318,22 +510,22 @@ const handleSearch = async () => {
   display: flex;
   gap: 12px;
   padding: 16px;
-  background: rgba(30, 41, 59, 0.4);
-  border: 1px solid rgba(0, 240, 255, 0.1);
+  background: #ffffff;
+  border: 1px solid rgba(99, 102, 241, 0.1);
   border-radius: 12px;
   transition: all 0.3s ease;
 }
 
 .result-card:hover {
-  border-color: rgba(0, 240, 255, 0.3);
-  background: rgba(30, 41, 59, 0.6);
+  border-color: rgba(99, 102, 241, 0.3);
+  background: #ffffff;
 }
 
 .result-rank {
   width: 32px;
   height: 32px;
   border-radius: 8px;
-  background: linear-gradient(135deg, #00f0ff 0%, #7c3aed 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -349,7 +541,7 @@ const handleSearch = async () => {
 }
 
 .result-text {
-  color: #e2e8f0;
+  color: #1e293b;
   font-size: 14px;
   line-height: 1.7;
   margin-bottom: 8px;

@@ -30,15 +30,15 @@ const pageTitle = computed(() => titles[route.path] || '')
   align-items: center;
   justify-content: space-between;
   padding: 0 28px;
-  background: rgba(15, 23, 42, 0.6);
-  border-bottom: 1px solid rgba(0, 240, 255, 0.08);
+  background: rgba(255, 255, 255, 0.9);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.08);
   backdrop-filter: blur(10px);
 }
 
 .page-title {
   font-size: 20px;
   font-weight: 600;
-  color: #e2e8f0;
+  color: #1e293b;
   margin: 0;
 }
 

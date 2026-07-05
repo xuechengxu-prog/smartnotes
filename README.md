@@ -1,6 +1,6 @@
 # SmartNotes - AI 智能笔记助手
 
-基于多 Agent 架构的 AI 驱动笔记管理平台，集成笔记整理、智能问答、复习计划生成和知识库管理功能，支持流式输出和多用户隔离。
+基于多 Agent 架构的 AI 驱动笔记管理平台，集成笔记整理、智能问答、复习计划生成和知识库管理功能，支持流式输出、多用户隔离和 MCP 工具协议扩展。
 
 ## 功能特性
 
@@ -8,6 +8,7 @@
 - **复习计划 Agent** - 基于艾宾浩斯遗忘曲线生成科学的复习计划
 - **问答 Agent (ReAct)** - 支持工具调用的智能问答，可检索个人知识库
 - **企业级 RAG 知识检索** - Query 改写、数据清洗、智能切片、混合召回、MMR 重排
+- **MCP 工具协议扩展** - 基于 FastMCP 实现学习辅助工具（闪卡、测验、摘要）和联网搜索工具
 - **知识库管理** - 支持文本/文件上传，向量检索，用户数据隔离
 - **统一网关** - JWT 认证、Redis 滑动窗口限流、请求路由转发
 - **流式输出** - 所有 AI 功能均支持 SSE 流式响应
@@ -22,6 +23,7 @@
 | AI 框架 | LangChain + LangChain-OpenAI |
 | LLM 服务 | 阿里云百炼 Qwen3.7-plus |
 | Embedding | 阿里云百炼 text-embedding-v3 |
+| 工具协议 | MCP (FastMCP) |
 | 数据库 | MySQL 8.0 (SQLAlchemy 2.0 + aiomysql) |
 | 缓存/会话 | Redis 6.2 |
 | 向量数据库 | ChromaDB |
@@ -70,6 +72,13 @@
                                |  ChromaDB   |
                                |   :8005     |
                                +-------------+
+
+              +-----------+-----------+
+              |                       |
+        +-----v------+         +------v------+
+        | MCP Learn  |         | MCP Search  |
+        | (学习辅助)   |         | (联网搜索)   |
+        +-------------+         +--------------+
 ```
 
 ## 快速开始
@@ -140,10 +149,15 @@ smartnotes/
 │   ├── agent_note/           # 笔记整理 Agent
 │   ├── agent_plan/           # 复习计划 Agent
 │   ├── agent_qa/             # 问答 Agent (ReAct)
+│   │   ├── agent_core.py     # ReAct 循环核心
+│   │   └── tools.py          # Agent 工具集
 │   ├── chains/               # LangChain 链定义
 │   ├── common/               # 公共模块 (DB, Redis, JWT, Chroma)
 │   ├── config/               # 配置管理
 │   ├── gateway/              # 统一网关
+│   ├── mcp/                  # MCP 工具服务
+│   │   ├── smartnotes_server.py  # 学习辅助 MCP (闪卡/测验/摘要)
+│   │   └── web_search_server.py  # 联网搜索 MCP
 │   ├── rag/                  # RAG 增强模块
 │   │   ├── enhanced_rag.py   # 查询改写/数据清洗/智能切片/混合检索
 │   │   ├── document_loader.py # 文档加载与预处理
@@ -223,18 +237,17 @@ smartnotes/
 支持工具：
 - `knowledge_search` - 检索用户知识库
 - `calculator` - 数学计算
+- `add_knowledge` - 保存知识到知识库
+- MCP 扩展工具（闪卡、测验、联网搜索等）
 
-### 用户数据隔离
+### MCP 工具协议
 
-- 知识库按 `user_id` 隔离存储（collection: `user_{id}_default`）
-- 会话历史按用户隔离存储于 Redis
-- JWT Token 认证所有 API 请求
+基于 FastMCP 实现 MCP Server，为 Agent 提供标准化工具扩展：
 
-### 限流策略
+- **SmartNotesLearning Server** - 闪卡制作、测验生成、文本摘要
+- **WebSearch Server** - DuckDuckGo 联网搜索、网页内容提取
 
-基于 Redis 滑动窗口实现：
-- 已登录用户：按用户 ID 限流
-- 未登录用户：按 IP 限流
+MCP 协议实现工具注册与调用的解耦，新增工具无需修改 Agent 核心代码。
 
 ### 企业级 RAG 增强检索
 
@@ -249,6 +262,18 @@ smartnotes/
 2. **混合召回** - 语义向量检索 + BM25 关键词检索并行执行
 3. **RRF 融合排序** - Reciprocal Rank Fusion (k=60) 合并多路召回结果
 4. **MMR 多样性重排** - Maximal Marginal Relevance (lambda=0.55) 平衡相关性与多样性
+
+### 用户数据隔离
+
+- 知识库按 `user_id` 隔离存储（collection: `user_{id}_default`）
+- 会话历史按用户隔离存储于 Redis
+- JWT Token 认证所有 API 请求
+
+### 限流策略
+
+基于 Redis 滑动窗口实现：
+- 已登录用户：按用户 ID 限流
+- 未登录用户：按 IP 限流
 
 ## 开发指南
 
@@ -267,6 +292,10 @@ python -m uvicorn backend.gateway.main:app --reload --port 8000
 python -m uvicorn backend.agent_note.main:app --reload --port 8001
 python -m uvicorn backend.agent_plan.main:app --reload --port 8002
 python -m uvicorn backend.agent_qa.main:app --reload --port 8003
+
+# 启动 MCP Server（可选）
+python -m backend.mcp.smartnotes_server
+python -m backend.mcp.web_search_server
 ```
 
 ### 本地开发前端

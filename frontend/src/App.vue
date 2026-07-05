@@ -14,8 +14,8 @@
 
 body {
   font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-  background: #0a0e1a;
-  color: #e2e8f0;
+  background: #f0f4f8;
+  color: #1e293b;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -29,11 +29,11 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 240, 255, 0.15);
+  background: rgba(99, 102, 241, 0.15);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 240, 255, 0.3);
+  background: rgba(99, 102, 241, 0.3);
 }
 </style>

@@ -1,7 +1,7 @@
 <template>
   <aside class="sidebar">
     <div class="sidebar-header">
-      <el-icon size="28" color="#00f0ff"><Document /></el-icon>
+      <el-icon size="28" color="#6366f1"><Document /></el-icon>
       <span class="brand">SmartNotes</span>
     </div>
     <nav class="sidebar-nav">
@@ -54,8 +54,8 @@ const menuItems = [
 .sidebar {
   width: 220px;
   height: 100vh;
-  background: #0f172a;
-  border-right: 1px solid rgba(0, 240, 255, 0.1);
+  background: #ffffff;
+  border-right: 1px solid rgba(99, 102, 241, 0.1);
   display: flex;
   flex-direction: column;
   position: fixed;
@@ -70,13 +70,13 @@ const menuItems = [
   align-items: center;
   gap: 12px;
   padding: 0 20px;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.08);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.08);
 }
 
 .brand {
   font-size: 18px;
   font-weight: 700;
-  color: #fff;
+  color: #1e293b;
   letter-spacing: 1px;
 }
 
@@ -102,19 +102,19 @@ const menuItems = [
 }
 
 .nav-item:hover {
-  background: rgba(0, 240, 255, 0.06);
-  color: #e2e8f0;
+  background: rgba(99, 102, 241, 0.06);
+  color: #1e293b;
 }
 
 .nav-item.active {
-  background: rgba(0, 240, 255, 0.1);
-  color: #00f0ff;
-  box-shadow: 0 0 15px rgba(0, 240, 255, 0.08);
+  background: rgba(99, 102, 241, 0.1);
+  color: #6366f1;
+  box-shadow: 0 0 15px rgba(99, 102, 241, 0.08);
 }
 
 .sidebar-footer {
   padding: 16px;
-  border-top: 1px solid rgba(0, 240, 255, 0.08);
+  border-top: 1px solid rgba(99, 102, 241, 0.08);
 }
 
 .user-info {
@@ -127,7 +127,7 @@ const menuItems = [
 }
 
 .username {
-  color: #e2e8f0;
+  color: #1e293b;
   font-weight: 500;
 }
 

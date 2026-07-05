@@ -1,76 +1,121 @@
 """
-ReAct Agent 核心实现 v4.0
-完整链路：Query改写 -> 工具选择 -> 多路召回 -> 生成回答 -> 历史查询
+ReAct Agent 核心实现 v5.0
+架构：ReAct Prompt + Function Calling + MCP
+
+技术栈：
+  - ReAct Prompt: System Prompt 引导 LLM 进行 Thought -> Action -> Observation 推理
+  - Function Calling: LangGraph StateGraph + ToolNode + bind_tools() 原生工具调用
+  - MCP: 通过 langchain-mcp-adapters 统一加载外部 MCP Server 工具
 
 链路说明：
   1. 用户给出 query
   2. Agent 对 query 进行改写（指代消解、意图识别）
-  3. LLM 根据改写后的 query 选择调用哪个 tool
-  4. 调用 tool 同时检索知识库（BM25 + 语义多路召回）
-  5. 将召回内容与 query 同时发给 LLM
-  6. LLM 根据 prompt 生成回答（必须标注来源）
-  7. 用户问"是否基于知识库"、"用了哪些工具"、"保存到知识库"等问题
-  8. LLM 查询历史对话并参考历史给出回复或执行操作
+  3. 检测保存意图则直接调用 add_knowledge
+  4. LangGraph 编排 LLM 推理 + 工具调用循环
+  5. LLM 通过 Function Calling 原生选择和参数化工具
+  6. ToolNode 统一执行本地工具和 MCP 工具
+  7. 生成回答（必须标注来源）
 """
 import json
 import logging
-import re
 import time
 import uuid
 from typing import Optional, List, Dict, Any, AsyncIterator
 
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import (
+    HumanMessage, SystemMessage, AIMessage, ToolMessage
+)
+from langgraph.graph import MessagesState
 
 from backend.services.llm_service import llm_service
 from backend.common.redis_client import redis_client
-from backend.agent_qa.tools import AgentTools, TOOLS_DESCRIPTION
+from backend.agent_qa.tools import AgentTools, create_local_tools
 
 logger = logging.getLogger(__name__)
+
+# ReAct 风格 System Prompt，引导 LLM 进行推理-行动循环
+REACT_SYSTEM_PROMPT = """你是SmartNotes智能学习助手，一个基于 ReAct（推理+行动）架构的智能 Agent。
+
+【工作方式】
+你会按照 Thought -> Action -> Observation -> Final Answer 的循环来思考和回答问题：
+1. Thought: 分析用户问题，思考需要使用什么工具或信息
+2. Action: 通过 Function Calling 调用合适的工具获取信息
+3. Observation: 获取工具返回的结果
+4. 重复上述步骤直到收集到足够信息
+5. Final Answer: 综合所有信息生成最终回答
+
+【工具使用规则】
+- 回答用户问题前，必须先调用 search_knowledge 搜索知识库
+- search_knowledge 支持 collection_name 参数指定知识库名称（如 "agent_memory"），不填则搜索用户所有知识库
+- 如果搜索到相关内容，基于搜索结果回答；如果未找到，再使用自身知识回答
+- 当用户说"保存"、"记录"、"存到知识库"时，调用 add_knowledge 工具
+- add_knowledge 支持 collection_name 参数指定保存到哪个知识库，不填则使用默认知识库
+- 可以使用联网搜索工具获取最新信息
+- 可以使用学习辅助工具（闪卡、测验、摘要）帮助用户学习
+
+【回答规范】
+- 每个回答末尾必须加来源标注："📚 来源：您的知识库" 或 "📚 来源：模型自身知识"
+- 只有 search_knowledge 成功找到内容时来源才是"您的知识库"
+- 如果使用了联网搜索，标注："📚 来源：联网搜索"
+- 回答应准确、有条理、有深度"""
 
 
 class ReActAgent:
     """
-    ReAct Agent v4.0 - 完整RAG链路实现
+    ReAct Agent v5.0 - Function Calling + MCP 架构
     """
 
-    TOOLS = {
-        "search_knowledge": AgentTools.search_knowledge,
-        "add_knowledge": AgentTools.add_knowledge,
-        "calculator": AgentTools.calculator,
-        "get_used_tools": AgentTools.get_used_tools,
-        "web_search_placeholder": AgentTools.web_search_placeholder,
-    }
-
-    def __init__(self, user_id: int, session_id: Optional[str] = None):
+    def __init__(self, user_id: int, session_id: Optional[str] = None,
+                 mcp_tools: Optional[list] = None):
         self.user_id = user_id
         self.session_id = session_id or str(uuid.uuid4())
+        self.mcp_tools = mcp_tools or []
         self.max_iterations = 8
-        # 记录本次对话是否使用了知识库
         self.used_knowledge = False
-        # 记录本次对话使用的工具
         self.used_tools = []
 
-    def _build_system_prompt(self) -> str:
-        return f"""你是SmartNotes智能学习助手。用户ID={self.user_id}，会话ID={self.session_id}。
+        # 构建本地 Function Calling 工具
+        self.local_tools = create_local_tools(self.user_id, self.session_id)
 
-可用工具：
-{TOOLS_DESCRIPTION}
+        # 合并所有工具（本地 + MCP）
+        self.all_tools = self.local_tools + self.mcp_tools
 
-【强制规则】
-规则1（记忆）：对话历史已自动注入。请仔细阅读历史消息理解用户意图。
-规则2（搜索优先）：回答用户问题前，必须先调用search_knowledge搜索知识库。如果搜索到相关内容，基于搜索结果回答；如果未找到，再使用自身知识回答。
-规则3（保存到知识库）：当用户说"保存"、"记录"、"存到知识库"时，你必须调用add_knowledge工具。text参数必须包含完整的内容（至少100字），可以从历史对话中提取AI的回答内容。
-规则4（工具查询）：当用户问"你用了什么工具"、"你调用了哪些工具"时，调用get_used_tools查询并如实回答。
-规则5（来源标注）：每个Final Answer末尾必须加："📚 来源：您的知识库" 或 "📚 来源：模型自身知识"。只有search_knowledge成功找到内容时来源才是"您的知识库"。
+        # 构建 LangGraph
+        self._graph = self._build_graph()
 
-输出格式：
-Thought: 你的思考
-Action: 工具名
-Action Input: {{"参数": "值"}}
-Observation: [工具返回，系统自动填充]
-...
-Final Answer: 回答（末尾加来源标注）
-"""
+    def _build_graph(self):
+        """用 LangGraph StateGraph 构建 ReAct 推理循环"""
+        from langgraph.graph import StateGraph, MessagesState, START, END
+        from langgraph.prebuilt import ToolNode, tools_condition
+        from langgraph.graph.message import add_messages
+
+        tools = self.all_tools
+
+        async def call_model(state: MessagesState):
+            """调用 LLM，通过 bind_tools 启用 Function Calling"""
+            messages = state["messages"]
+            # 在消息列表前面插入 System Prompt
+            system_msg = SystemMessage(content=REACT_SYSTEM_PROMPT)
+            all_messages = [system_msg] + messages
+
+            # bind_tools 将工具 schema 发送给 LLM，启用原生 Function Calling
+            llm_with_tools = llm_service.llm.bind_tools(tools)
+            response = await llm_with_tools.ainvoke(all_messages)
+            return {"messages": response}
+
+        # 构建状态图
+        builder = StateGraph(MessagesState)
+
+        # 添加节点
+        builder.add_node("agent", call_model)
+        builder.add_node("tools", ToolNode(tools))
+
+        # 定义边：START -> agent -> (条件判断) -> tools 或 END
+        builder.add_edge(START, "agent")
+        builder.add_conditional_edges("agent", tools_condition)
+        builder.add_edge("tools", "agent")
+
+        return builder.compile()
 
     async def _get_history(self, limit: int = 10) -> List[Dict[str, str]]:
         try:
@@ -96,7 +141,6 @@ Final Answer: 回答（末尾加来源标注）
             await redis_client.client.ltrim(key, -50, -1)
             await redis_client.client.expire(key, 604800)
 
-            # 更新 session meta（记录 updated_at 时间戳）
             meta_key = f"agent:session_meta:{self.user_id}:{self.session_id}"
             meta = {"updated_at": str(time.time()), "session_id": self.session_id}
             await redis_client.client.hset(meta_key, mapping=meta)
@@ -113,112 +157,35 @@ Final Answer: 回答（末尾加来源标注）
             truncated = truncated[:last_period + 1]
         return truncated + "\n[...内容已截断]"
 
-    def _parse_action(self, text: str) -> Optional[Dict[str, Any]]:
-        action_match = re.search(r"Action:\s*(\w+)", text, re.IGNORECASE)
-        if not action_match:
-            return None
-        action_name = action_match.group(1).strip()
+    def _is_save_intent(self, question: str) -> bool:
+        save_keywords = ["保存", "记录", "存到知识库", "存入知识库", "添加到知识库", "放进知识库"]
+        return any(kw in question for kw in save_keywords)
 
-        input_match = re.search(r"Action Input:\s*(\{.*?\})\s*(?:\n|$)", text, re.DOTALL)
-        if input_match:
-            try:
-                action_input = json.loads(input_match.group(1))
-                return {"action": action_name, "input": action_input}
-            except json.JSONDecodeError:
-                return {"action": action_name, "input": {"query": input_match.group(1).strip()}}
+    async def _rewrite_query(self, question: str, history: List[Dict[str, str]]) -> str:
+        rewritten = AgentTools.query_rewrite(question, history)
+        logger.info(f"Query rewrite: '{question}' -> '{rewritten}'")
+        return rewritten
 
-        func_match = re.search(rf"Action:\s*{action_name}\s*\((.*?)\)", text, re.DOTALL)
-        if func_match:
-            try:
-                action_input = json.loads("{" + func_match.group(1) + "}")
-                return {"action": action_name, "input": action_input}
-            except:
-                return {"action": action_name, "input": {"query": func_match.group(1).strip()}}
-
-        return {"action": action_name, "input": {}}
-
-    def _has_final_answer(self, text: str) -> bool:
-        return bool(re.search(r"Final Answer:", text, re.IGNORECASE))
-
-    def _extract_final_answer(self, text: str) -> str:
-        match = re.search(r"Final Answer:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return text.strip()
-
-    def _extract_thought(self, text: str) -> Optional[str]:
-        match = re.search(r"Thought:\s*(.*?)(?:\nAction:|\nFinal Answer:|$)", text, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return None
-
-    async def _call_tool(self, action_name: str, action_input: Dict[str, Any]) -> str:
-        if action_name not in self.TOOLS:
-            return f"错误：未知工具 '{action_name}'"
-
-        tool_func = self.TOOLS[action_name]
-
-        # 自动注入必要参数
-        if "user_id" not in action_input:
-            action_input["user_id"] = self.user_id
-        if "session_id" not in action_input:
-            action_input["session_id"] = self.session_id
-
-        # 特殊处理：add_knowledge 时如果 text 为空或太短，自动从历史中提取
-        if action_name == "add_knowledge":
-            text = action_input.get("text", "")
-            if not text or len(text.strip()) < 50:
-                logger.warning(f"add_knowledge text too short ({len(text) if text else 0} chars), extracting from history")
-                history = await self._get_history(limit=10)
-                extracted = self._extract_content_for_save(history)
-                if extracted:
-                    action_input["text"] = extracted
-                    logger.info(f"Extracted content for save: {len(extracted)} chars")
-                else:
-                    return "错误：无法从历史对话中提取有效内容。请确保对话中有足够的信息可供保存。"
-
-        try:
-            result = tool_func(**action_input)
-            # 记录工具使用
-            if action_name not in self.used_tools:
-                self.used_tools.append(action_name)
-            # 只有 search_knowledge 成功找到内容时才标记 used_knowledge
-            if action_name == "search_knowledge" and "未找到" not in result and "出错" not in result and len(result) > 50:
-                self.used_knowledge = True
-            return str(result)
-        except Exception as e:
-            logger.error(f"Tool {action_name} failed: {e}")
-            return f"工具调用失败: {str(e)}"
-
-    def _extract_content_for_save(self, history: List[Dict[str, str]]) -> str:
-        """从历史对话中提取可用于保存到知识库的完整内容"""
+    async def _extract_content_for_save(self, history: List[Dict[str, str]]) -> str:
         if not history:
             return ""
-
         parts = []
-        # 提取最近一轮完整的 QA（用户问题 + AI 回答）
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "assistant" and content and len(content) > 100:
-                # 找到 assistant 的详细回答，往前找对应的 user 问题
                 parts.append(f"问题：{history[i-1].get('content', '') if i > 0 else ''}\n\n回答：{content}")
                 break
-
         if parts:
             return parts[0]
-
-        #  fallback：提取所有 assistant 的回复拼接
         for msg in history:
             if msg.get("role") == "assistant" and msg.get("content"):
                 parts.append(msg.get("content"))
-
         return "\n\n---\n\n".join(parts) if parts else ""
 
-    def _build_messages_with_history(self, question: str, history: List[Dict[str, str]]) -> List:
-        messages = [SystemMessage(content=self._build_system_prompt())]
-
+    async def _build_messages_with_history(self, question: str, history: List[Dict[str, str]]) -> List:
+        messages = []
         for msg in history:
             role = msg.get("role", "user")
             content = self._truncate_content(msg.get("content", ""), max_len=600)
@@ -226,139 +193,107 @@ Final Answer: 回答（末尾加来源标注）
                 messages.append(HumanMessage(content=content))
             elif role == "assistant":
                 messages.append(AIMessage(content=content))
-
-        messages.append(HumanMessage(content=f"用户当前问题: {question}\n\n请按ReAct格式思考并回答。"))
+        messages.append(HumanMessage(content=question))
         return messages
 
-    async def _rewrite_query(self, question: str, history: List[Dict[str, str]]) -> str:
-        """Step 1: Query改写"""
-        rewritten = AgentTools.query_rewrite(question, history)
-        logger.info(f"Query rewrite: '{question}' -> '{rewritten}'")
-        return rewritten
+    def _extract_answer_and_tools(self, state: MessagesState) -> tuple:
+        """从 LangGraph 状态中提取最终回答和使用的工具列表"""
+        messages = state.get("messages", [])
+        used_tools = []
+        knowledge_used = False
+
+        for msg in messages:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_name = tc.get("name", "unknown")
+                    if tool_name not in used_tools:
+                        used_tools.append(tool_name)
+                    if tool_name == "search_knowledge":
+                        knowledge_used = True
+            elif isinstance(msg, ToolMessage):
+                # 检查 search_knowledge 的返回是否包含有效内容
+                if hasattr(msg, 'name') and msg.name == "search_knowledge":
+                    content = msg.content if hasattr(msg, 'content') else str(msg)
+                    if "未找到" not in content and "出错" not in content and len(content) > 50:
+                        knowledge_used = True
+
+        # 提取最终文本回答
+        final_text = ""
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
+                final_text = msg.content
+                break
+
+        return final_text, used_tools, knowledge_used
 
     async def run(self, question: str) -> Dict[str, Any]:
-        """
-        完整链路运行（非流式）
-        返回包含 answer, thoughts, actions, used_tools, source, session_id
-        """
-        thoughts = []
-        actions = []
+        """完整链路运行（非流式）"""
         self.used_tools = []
         self.used_knowledge = False
 
-        # 保存用户问题
         await self._save_message("user", question)
 
-        # 强制处理保存意图：直接调用 add_knowledge，不经过 LLM 判断
+        # 强制处理保存意图
         if self._is_save_intent(question):
-            history = await self._get_history(limit=10)
-            content_to_save = self._extract_content_for_save(history)
-            if content_to_save:
-                result = AgentTools.add_knowledge(
-                    user_id=self.user_id,
-                    text=content_to_save,
-                    session_id=self.session_id
-                )
-                if "已添加" in result or "成功" in result:
-                    self.used_tools.append("add_knowledge")
-                    answer = f"已将内容保存到知识库中。\n\n📚 来源：模型自身知识"
-                else:
-                    answer = f"保存时出现问题：{result}\n\n📚 来源：模型自身知识"
-                await self._save_message("assistant", answer)
-                return {
-                    "answer": answer,
-                    "thoughts": ["检测到保存意图，直接调用add_knowledge"],
-                    "actions": [{"action": "add_knowledge", "input": {"text": content_to_save[:50] + "..."}}],
-                    "used_tools": self.used_tools,
-                    "source": "llm",
-                    "session_id": self.session_id,
-                }
-            else:
-                answer = "未能从历史对话中找到可保存的内容。请先进行对话，再尝试保存。\n\n📚 来源：模型自身知识"
-                await self._save_message("assistant", answer)
-                return {
-                    "answer": answer,
-                    "thoughts": ["检测到保存意图但无内容可保存"],
-                    "actions": [],
-                    "used_tools": self.used_tools,
-                    "source": "llm",
-                    "session_id": self.session_id,
-                }
+            return await self._handle_save_intent(question)
 
         # Step 1: Query改写
         history = await self._get_history(limit=10)
         rewritten_query = await self._rewrite_query(question, history)
 
-        # Step 2-6: ReAct循环（工具选择 -> 多路召回 -> 生成回答）
-        messages = self._build_messages_with_history(rewritten_query, history)
+        # Step 2-6: LangGraph 编排（Function Calling + MCP）
+        messages = await self._build_messages_with_history(rewritten_query, history)
 
-        iteration = 0
-        while iteration < self.max_iterations:
-            iteration += 1
+        try:
+            config = {"recursion_limit": self.max_iterations}
+            state = await self._graph.ainvoke({"messages": messages}, config=config)
+        except Exception as e:
+            logger.error(f"LangGraph execution failed: {e}")
+            fallback = f"抱歉，处理您的问题时出现了错误：{str(e)}"
+            await self._save_message("assistant", fallback)
+            return {
+                "answer": fallback + "\n\n📚 来源：模型自身知识",
+                "thoughts": ["LangGraph 执行出错"],
+                "actions": [],
+                "used_tools": self.used_tools,
+                "source": "llm",
+                "session_id": self.session_id,
+            }
 
-            response = await llm_service.llm.ainvoke(messages)
-            response_text = response.content
+        # 提取结果
+        answer, used_tools, knowledge_used = self._extract_answer_and_tools(state)
+        self.used_tools = used_tools
+        self.used_knowledge = knowledge_used
 
-            thought = self._extract_thought(response_text)
-            if thought:
-                thoughts.append(thought)
-
-            if self._has_final_answer(response_text):
-                final_answer = self._extract_final_answer(response_text)
-
-                # 确保有来源标注
-                if "📚 来源" not in final_answer:
-                    if self.used_knowledge:
-                        final_answer += "\n\n📚 来源：您的知识库"
-                    else:
-                        final_answer += "\n\n📚 来源：模型自身知识"
-
-                await self._save_message("assistant", final_answer)
-                return {
-                    "answer": final_answer,
-                    "thoughts": thoughts,
-                    "actions": actions,
-                    "used_tools": self.used_tools,
-                    "source": "knowledge_base" if self.used_knowledge else "llm",
-                    "session_id": self.session_id,
-                }
-
-            action_info = self._parse_action(response_text)
-            if action_info:
-                actions.append(action_info)
-                action_name = action_info["action"]
-                action_input = action_info["input"]
-
-                observation = await self._call_tool(action_name, action_input)
-
-                messages.append(AIMessage(content=response_text))
-                messages.append(HumanMessage(content=f"Observation: {observation}\n\n请继续思考。"))
+        # 确保有来源标注
+        if answer and "📚 来源" not in answer:
+            if self.used_knowledge:
+                answer += "\n\n📚 来源：您的知识库"
             else:
-                # 没有Action也没有Final Answer
-                if "📚 来源" not in response_text:
-                    if self.used_knowledge:
-                        response_text += "\n\n📚 来源：您的知识库"
-                    else:
-                        response_text += "\n\n📚 来源：模型自身知识"
+                answer += "\n\n📚 来源：模型自身知识"
+        elif not answer:
+            answer = "抱歉，我未能生成有效的回答。"
 
-                await self._save_message("assistant", response_text)
-                return {
-                    "answer": response_text,
-                    "thoughts": thoughts,
-                    "actions": actions,
-                    "used_tools": self.used_tools,
-                    "source": "knowledge_base" if self.used_knowledge else "llm",
-                    "session_id": self.session_id,
-                }
+        await self._save_message("assistant", answer)
 
-        fallback = "抱歉，我尝试了多次但未能找到满意的答案。"
-        if self.used_knowledge:
-            fallback += "\n\n📚 来源：您的知识库"
-        else:
-            fallback += "\n\n📚 来源：模型自身知识"
-        await self._save_message("assistant", fallback)
+        # 提取 thought 过程（从 AIMessage 的 content 中）
+        thoughts = []
+        for msg in state.get("messages", []):
+            if isinstance(msg, AIMessage) and msg.tool_calls and msg.content:
+                thoughts.append(msg.content.strip())
+
+        # 提取 actions 信息
+        actions = []
+        for msg in state.get("messages", []):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    actions.append({
+                        "action": tc.get("name"),
+                        "input": tc.get("args", {}),
+                    })
+
         return {
-            "answer": fallback,
+            "answer": answer,
             "thoughts": thoughts,
             "actions": actions,
             "used_tools": self.used_tools,
@@ -366,28 +301,56 @@ Final Answer: 回答（末尾加来源标注）
             "session_id": self.session_id,
         }
 
-    def _is_save_intent(self, question: str) -> bool:
-        """检测用户是否有保存到知识库的意图"""
-        save_keywords = ["保存", "记录", "存到知识库", "存入知识库", "添加到知识库", "放进知识库"]
-        return any(kw in question for kw in save_keywords)
+    async def _handle_save_intent(self, question: str) -> Dict[str, Any]:
+        """处理保存意图"""
+        history = await self._get_history(limit=10)
+        content_to_save = await self._extract_content_for_save(history)
+        if content_to_save:
+            result = AgentTools.add_knowledge_impl(
+                user_id=self.user_id,
+                text=content_to_save,
+                session_id=self.session_id
+            )
+            if "已添加" in result or "成功" in result:
+                self.used_tools.append("add_knowledge")
+                answer = f"已将内容保存到知识库中。\n\n📚 来源：模型自身知识"
+            else:
+                answer = f"保存时出现问题：{result}\n\n📚 来源：模型自身知识"
+            await self._save_message("assistant", answer)
+            return {
+                "answer": answer,
+                "thoughts": ["检测到保存意图，直接调用add_knowledge"],
+                "actions": [{"action": "add_knowledge", "input": {"text": content_to_save[:50] + "..."}}],
+                "used_tools": self.used_tools,
+                "source": "llm",
+                "session_id": self.session_id,
+            }
+        else:
+            answer = "未能从历史对话中找到可保存的内容。请先进行对话，再尝试保存。\n\n📚 来源：模型自身知识"
+            await self._save_message("assistant", answer)
+            return {
+                "answer": answer,
+                "thoughts": ["检测到保存意图但无内容可保存"],
+                "actions": [],
+                "used_tools": self.used_tools,
+                "source": "llm",
+                "session_id": self.session_id,
+            }
 
     async def run_stream(self, question: str) -> AsyncIterator[Dict[str, Any]]:
-        """
-        完整链路运行（流式）
-        yield包含 type, content, 以及可选的 used_tools, source
-        """
+        """完整链路运行（流式）"""
         self.used_tools = []
         self.used_knowledge = False
 
         await self._save_message("user", question)
 
-        # 强制处理保存意图：直接调用 add_knowledge，不经过 LLM 判断
+        # 强制处理保存意图
         if self._is_save_intent(question):
             history = await self._get_history(limit=10)
-            content_to_save = self._extract_content_for_save(history)
+            content_to_save = await self._extract_content_for_save(history)
             if content_to_save:
                 yield {"type": "action", "content": "正在保存到知识库..."}
-                result = AgentTools.add_knowledge(
+                result = AgentTools.add_knowledge_impl(
                     user_id=self.user_id,
                     text=content_to_save,
                     session_id=self.session_id
@@ -398,96 +361,91 @@ Final Answer: 回答（末尾加来源标注）
                 else:
                     answer = f"保存时出现问题：{result}\n\n📚 来源：模型自身知识"
                 yield {"type": "final_answer", "content": answer,
-                       "used_tools": self.used_tools,
-                       "source": "llm"}
+                       "used_tools": self.used_tools, "source": "llm"}
                 await self._save_message("assistant", answer)
-                return
             else:
                 answer = "未能从历史对话中找到可保存的内容。请先进行对话，再尝试保存。\n\n📚 来源：模型自身知识"
                 yield {"type": "final_answer", "content": answer,
-                       "used_tools": self.used_tools,
-                       "source": "llm"}
+                       "used_tools": self.used_tools, "source": "llm"}
                 await self._save_message("assistant", answer)
-                return
+            return
 
         # Step 1: Query改写
         history = await self._get_history(limit=10)
         rewritten_query = await self._rewrite_query(question, history)
 
-        messages = self._build_messages_with_history(rewritten_query, history)
+        # Step 2-6: LangGraph 流式执行
+        messages = await self._build_messages_with_history(rewritten_query, history)
 
-        iteration = 0
-        thought_yielded = False
+        try:
+            config = {"recursion_limit": self.max_iterations}
 
-        while iteration < self.max_iterations:
-            iteration += 1
+            # 使用 astream 逐步获取事件
+            async for event in self._graph.astream_events(
+                {"messages": messages}, config=config, version="v2"
+            ):
+                event_type = event.get("event", "")
 
-            buffer = ""
-            async for chunk in llm_service.llm.astream(messages):
-                text = chunk.content
-                if text:
-                    buffer += text
-                    yield {"type": "token", "content": text}
+                # LLM 生成的 token（流式输出）
+                if event_type == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        yield {"type": "token", "content": chunk.content}
 
-            response_text = buffer
+                # 工具调用开始
+                elif event_type == "on_tool_start":
+                    tool_name = event.get("name", "unknown")
+                    yield {"type": "action", "content": f"正在调用工具: {tool_name}"}
+                    if tool_name not in self.used_tools:
+                        self.used_tools.append(tool_name)
+                    if tool_name == "search_knowledge":
+                        self.used_knowledge = True
 
-            if not thought_yielded:
-                thought = self._extract_thought(response_text)
-                if thought:
-                    yield {"type": "thought", "content": thought}
-                    thought_yielded = True
+                # 工具返回结果
+                elif event_type == "on_tool_end":
+                    output = event.get("data", {}).get("output", "")
+                    if output:
+                        output_str = str(output)
+                        yield {"type": "observation", "content": output_str[:500]}
 
-            if self._has_final_answer(response_text):
-                final_answer = self._extract_final_answer(response_text)
+        except Exception as e:
+            logger.error(f"LangGraph stream failed: {e}")
+            yield {"type": "final_answer",
+                   "content": f"抱歉，处理您的问题时出现了错误：{str(e)}\n\n📚 来源：模型自身知识",
+                   "used_tools": self.used_tools, "source": "llm"}
+            return
 
-                # 确保有来源标注
-                if "📚 来源" not in final_answer:
-                    if self.used_knowledge:
-                        final_answer += "\n\n📚 来源：您的知识库"
-                    else:
-                        final_answer += "\n\n📚 来源：模型自身知识"
+        # 流式结束后，获取完整状态以提取最终回答
+        try:
+            state = await self._graph.ainvoke({"messages": messages}, config=config)
+            answer, used_tools, knowledge_used = self._extract_answer_and_tools(state)
+            self.used_tools = list(set(self.used_tools + used_tools))
+            if knowledge_used:
+                self.used_knowledge = True
 
-                yield {"type": "final_answer", "content": final_answer,
-                       "used_tools": self.used_tools,
-                       "source": "knowledge_base" if self.used_knowledge else "llm"}
-                await self._save_message("assistant", final_answer)
-                return
+            if answer and "📚 来源" not in answer:
+                if self.used_knowledge:
+                    answer += "\n\n📚 来源：您的知识库"
+                else:
+                    answer += "\n\n📚 来源：模型自身知识"
+        except:
+            answer = ""
 
-            action_info = self._parse_action(response_text)
-            if action_info:
-                yield {"type": "action", "content": f"正在调用工具: {action_info['action']}"}
-
-                action_name = action_info["action"]
-                action_input = action_info["input"]
-
-                observation = await self._call_tool(action_name, action_input)
-                yield {"type": "observation", "content": observation}
-
-                messages.append(AIMessage(content=response_text))
-                messages.append(HumanMessage(content=f"Observation: {observation}\n\n请继续思考。"))
-            else:
-                if "📚 来源" not in response_text:
-                    if self.used_knowledge:
-                        response_text += "\n\n📚 来源：您的知识库"
-                    else:
-                        response_text += "\n\n📚 来源：模型自身知识"
-
-                yield {"type": "final_answer", "content": response_text,
-                       "used_tools": self.used_tools,
-                       "source": "knowledge_base" if self.used_knowledge else "llm"}
-                await self._save_message("assistant", response_text)
-                return
-
-        fallback = "抱歉，我尝试了多次但未能找到满意的答案。"
-        if self.used_knowledge:
-            fallback += "\n\n📚 来源：您的知识库"
+        if answer:
+            await self._save_message("assistant", answer)
+            yield {"type": "final_answer", "content": answer,
+                   "used_tools": self.used_tools,
+                   "source": "knowledge_base" if self.used_knowledge else "llm"}
         else:
-            fallback += "\n\n📚 来源：模型自身知识"
-        yield {"type": "final_answer", "content": fallback,
-               "used_tools": self.used_tools,
-               "source": "knowledge_base" if self.used_knowledge else "llm"}
-        await self._save_message("assistant", fallback)
+            # 从 token 流中可能已经发送了内容，这里不重复发送
+            # 发送一个带来源标注的结束事件
+            source = "knowledge_base" if self.used_knowledge else "llm"
+            source_label = "您的知识库" if self.used_knowledge else "模型自身知识"
+            yield {"type": "final_answer",
+                   "content": f"\n\n📚 来源：{source_label}",
+                   "used_tools": self.used_tools, "source": source}
 
 
-async def create_agent(user_id: int, session_id: Optional[str] = None) -> ReActAgent:
-    return ReActAgent(user_id=user_id, session_id=session_id)
+async def create_agent(user_id: int, session_id: Optional[str] = None,
+                        mcp_tools: Optional[list] = None) -> ReActAgent:
+    return ReActAgent(user_id=user_id, session_id=session_id, mcp_tools=mcp_tools)

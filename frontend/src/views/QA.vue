@@ -96,7 +96,7 @@
             :class="['message', msg.role]"
           >
             <div class="message-avatar">
-              <el-icon size="20" :color="msg.role === 'user' ? '#00f0ff' : '#a855f7'">
+              <el-icon size="20" :color="msg.role === 'user' ? '#6366f1' : '#8b5cf6'">
                 <component :is="msg.role === 'user' ? User : ChatDotRound" />
               </el-icon>
             </div>
@@ -116,7 +116,7 @@
             </div>
           </div>
           <div v-if="messages.length === 0" class="empty-state">
-            <el-icon size="48" color="rgba(0, 240, 255, 0.3)"><ChatDotRound /></el-icon>
+            <el-icon size="48" color="rgba(99, 102, 241, 0.3)"><ChatDotRound /></el-icon>
             <p>开始你的智能问答之旅</p>
             <span class="hint">输入问题，ReAct Agent 将自主决策并调用工具为你解答</span>
           </div>
@@ -191,7 +191,7 @@ const toggleSidebar = () => {
 
 const formatTime = (timestamp) => {
   if (!timestamp) return ''
-  const date = new Date(timestamp)
+  const date = new Date(Number(timestamp) * 1000)
   const now = new Date()
   const diff = now - date
   const minutes = Math.floor(diff / 60000)
@@ -538,12 +538,13 @@ onMounted(async () => {
 .sidebar {
   width: 220px;
   min-width: 220px;
-  background: rgba(15, 23, 42, 0.7);
-  border-right: 1px solid rgba(0, 240, 255, 0.1);
+  background: rgba(255, 255, 255, 0.95);
+  border-right: 1px solid rgba(99, 102, 241, 0.1);
   display: flex;
   flex-direction: column;
   transition: all 0.3s ease;
   overflow: hidden;
+  box-shadow: 2px 0 20px rgba(0, 0, 0, 0.04);
 }
 
 .sidebar.collapsed {
@@ -556,14 +557,14 @@ onMounted(async () => {
   align-items: center;
   justify-content: space-between;
   padding: 12px 16px;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.08);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.08);
   height: 52px;
 }
 
 .sidebar-title {
   font-size: 15px;
   font-weight: 600;
-  color: #e2e8f0;
+  color: #1e293b;
 }
 
 .collapse-btn {
@@ -572,7 +573,7 @@ onMounted(async () => {
 }
 
 .collapse-btn:hover {
-  color: #00f0ff;
+  color: #6366f1;
 }
 
 .session-list {
@@ -593,7 +594,7 @@ onMounted(async () => {
 }
 
 .session-item:hover {
-  background: rgba(0, 240, 255, 0.06);
+  background: rgba(99, 102, 241, 0.06);
 }
 
 .session-item:hover .delete-btn {
@@ -601,12 +602,12 @@ onMounted(async () => {
 }
 
 .session-item.active {
-  background: rgba(0, 240, 255, 0.1);
-  border: 1px solid rgba(0, 240, 255, 0.15);
+  background: rgba(99, 102, 241, 0.1);
+  border: 1px solid rgba(99, 102, 241, 0.15);
 }
 
 .session-item.active .session-name {
-  color: #00f0ff;
+  color: #6366f1;
 }
 
 .session-info {
@@ -618,7 +619,7 @@ onMounted(async () => {
 .session-name {
   font-size: 13px;
   font-weight: 500;
-  color: #e2e8f0;
+  color: #1e293b;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -629,7 +630,7 @@ onMounted(async () => {
   display: flex;
   gap: 8px;
   font-size: 11px;
-  color: #64748b;
+  color: #94a3b8;
 }
 
 .msg-count {
@@ -637,13 +638,13 @@ onMounted(async () => {
 }
 
 .session-time {
-  color: #64748b;
+  color: #94a3b8;
 }
 
 .delete-btn {
   opacity: 0;
   transition: opacity 0.2s ease;
-  color: #64748b;
+  color: #94a3b8;
   padding: 2px;
   margin-left: 4px;
 }
@@ -655,25 +656,25 @@ onMounted(async () => {
 .no-sessions {
   text-align: center;
   padding: 32px 16px;
-  color: #64748b;
+  color: #94a3b8;
   font-size: 13px;
 }
 
 .sidebar-footer {
   padding: 12px 16px;
-  border-top: 1px solid rgba(0, 240, 255, 0.08);
+  border-top: 1px solid rgba(99, 102, 241, 0.08);
 }
 
 .new-session-btn {
   width: 100%;
-  background: linear-gradient(135deg, #00f0ff 0%, #7c3aed 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   border: none;
   border-radius: 10px;
   font-weight: 500;
 }
 
 .new-session-btn:hover {
-  box-shadow: 0 4px 15px rgba(0, 240, 255, 0.3);
+  box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
 }
 
 /* ==================== 主聊天区域 ==================== */
@@ -682,7 +683,7 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: rgba(15, 23, 42, 0.4);
+  background: #ffffff;
 }
 
 .chat-header {
@@ -690,16 +691,16 @@ onMounted(async () => {
   align-items: center;
   justify-content: space-between;
   padding: 12px 20px;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.08);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.08);
   height: 52px;
-  background: rgba(15, 23, 42, 0.5);
+  background: #ffffff;
   flex-shrink: 0;
 }
 
 .header-title {
   font-size: 15px;
   font-weight: 600;
-  color: #e2e8f0;
+  color: #1e293b;
 }
 
 .header-actions {
@@ -765,13 +766,13 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 240, 255, 0.08);
-  border: 1px solid rgba(0, 240, 255, 0.15);
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(99, 102, 241, 0.15);
   flex-shrink: 0;
 }
 
 .message.user .message-avatar {
-  background: rgba(0, 240, 255, 0.12);
+  background: rgba(99, 102, 241, 0.12);
 }
 
 .message-bubble {
@@ -785,15 +786,15 @@ onMounted(async () => {
 }
 
 .message.user .message-bubble {
-  background: rgba(0, 240, 255, 0.12);
-  color: #e2e8f0;
-  border: 1px solid rgba(0, 240, 255, 0.15);
+  background: rgba(99, 102, 241, 0.12);
+  color: #1e293b;
+  border: 1px solid rgba(99, 102, 241, 0.15);
 }
 
 .message.assistant .message-bubble {
-  background: rgba(124, 58, 237, 0.08);
-  color: #cbd5e1;
-  border: 1px solid rgba(124, 58, 237, 0.12);
+  background: rgba(139, 92, 246, 0.08);
+  color: #475569;
+  border: 1px solid rgba(139, 92, 246, 0.12);
 }
 
 /* 空内容占位 */
@@ -804,7 +805,7 @@ onMounted(async () => {
 
 /* Markdown 渲染样式 */
 :deep(.markdown-body) {
-  color: #cbd5e1;
+  color: #475569;
   font-size: 14px;
   line-height: 1.7;
 }
@@ -815,10 +816,10 @@ onMounted(async () => {
 :deep(.markdown-body h4),
 :deep(.markdown-body h5),
 :deep(.markdown-body h6) {
-  color: #e2e8f0;
+  color: #1e293b;
   margin: 12px 0 8px;
   font-weight: 600;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.1);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.1);
   padding-bottom: 4px;
 }
 
@@ -828,11 +829,11 @@ onMounted(async () => {
 
 :deep(.markdown-body p) {
   margin: 6px 0;
-  color: #cbd5e1;
+  color: #475569;
 }
 
 :deep(.markdown-body strong) {
-  color: #00f0ff;
+  color: #6366f1;
   font-weight: 600;
 }
 
@@ -847,8 +848,8 @@ onMounted(async () => {
 }
 
 :deep(.markdown-body code) {
-  background: rgba(0, 240, 255, 0.08);
-  color: #00f0ff;
+  background: rgba(99, 102, 241, 0.08);
+  color: #6366f1;
   padding: 2px 5px;
   border-radius: 4px;
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
@@ -856,8 +857,8 @@ onMounted(async () => {
 }
 
 :deep(.markdown-body pre) {
-  background: rgba(15, 23, 42, 0.8);
-  border: 1px solid rgba(0, 240, 255, 0.1);
+  background: #f8fafc;
+  border: 1px solid rgba(99, 102, 241, 0.1);
   border-radius: 8px;
   padding: 10px 14px;
   overflow-x: auto;
@@ -867,14 +868,14 @@ onMounted(async () => {
 :deep(.markdown-body pre code) {
   background: transparent;
   padding: 0;
-  color: #a5b4fc;
+  color: #818cf8;
 }
 
 :deep(.markdown-body blockquote) {
-  border-left: 3px solid rgba(0, 240, 255, 0.3);
+  border-left: 3px solid rgba(99, 102, 241, 0.3);
   margin: 8px 0;
   padding: 6px 14px;
-  background: rgba(0, 240, 255, 0.03);
+  background: rgba(99, 102, 241, 0.03);
   border-radius: 0 8px 8px 0;
 }
 
@@ -885,7 +886,7 @@ onMounted(async () => {
 
 :deep(.markdown-body hr) {
   border: none;
-  border-top: 1px solid rgba(0, 240, 255, 0.1);
+  border-top: 1px solid rgba(99, 102, 241, 0.1);
   margin: 12px 0;
 }
 
@@ -897,17 +898,17 @@ onMounted(async () => {
 }
 
 :deep(.markdown-body th) {
-  background: rgba(0, 240, 255, 0.06);
-  color: #e2e8f0;
+  background: rgba(99, 102, 241, 0.06);
+  color: #1e293b;
   padding: 6px 10px;
   text-align: left;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.15);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.15);
 }
 
 :deep(.markdown-body td) {
   padding: 6px 10px;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.08);
-  color: #cbd5e1;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.08);
+  color: #475569;
 }
 
 /* 思考中动画 */
@@ -922,7 +923,7 @@ onMounted(async () => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #a855f7;
+  background: #8b5cf6;
   opacity: 0.4;
   animation: thinking-bounce 1.4s infinite ease-in-out;
 }
@@ -946,7 +947,7 @@ onMounted(async () => {
   display: inline-block;
   width: 2px;
   height: 18px;
-  background: #00f0ff;
+  background: #6366f1;
   margin-left: 4px;
   animation: blink 1s infinite;
   vertical-align: middle;
@@ -961,15 +962,15 @@ onMounted(async () => {
   display: flex;
   gap: 12px;
   padding: 16px 20px;
-  border-top: 1px solid rgba(0, 240, 255, 0.1);
-  background: rgba(15, 23, 42, 0.6);
+  border-top: 1px solid rgba(99, 102, 241, 0.1);
+  background: rgba(255, 255, 255, 0.9);
   flex-shrink: 0;
 }
 
 .chat-input :deep(.el-textarea__inner) {
-  background: rgba(30, 41, 59, 0.6);
+  background: #ffffff;
   border: 1px solid rgba(148, 163, 184, 0.2);
-  color: #e2e8f0;
+  color: #1e293b;
   border-radius: 12px;
   padding: 10px 14px;
   resize: none;
@@ -980,7 +981,7 @@ onMounted(async () => {
 }
 
 .chat-input :deep(.el-textarea__inner:focus) {
-  border-color: rgba(0, 240, 255, 0.4);
+  border-color: rgba(99, 102, 241, 0.4);
 }
 
 .send-btn {
@@ -988,14 +989,14 @@ onMounted(async () => {
   height: 44px;
   padding: 0;
   border-radius: 12px;
-  background: linear-gradient(135deg, #00f0ff 0%, #7c3aed 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   border: none;
   flex-shrink: 0;
   align-self: center;
 }
 
 .send-btn:hover {
-  box-shadow: 0 4px 15px rgba(0, 240, 255, 0.3);
+  box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
 }
 
 /* 响应式适配 */
@@ -1004,7 +1005,7 @@ onMounted(async () => {
     position: absolute;
     z-index: 100;
     height: 100%;
-    box-shadow: 2px 0 10px rgba(0, 0, 0, 0.3);
+    box-shadow: 2px 0 10px rgba(0, 0, 0, 0.06);
   }
 
   .sidebar.collapsed {

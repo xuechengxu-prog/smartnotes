@@ -1,41 +1,49 @@
 """
-Agent 工具集定义 v3.0
-为 ReAct Agent 提供可调用工具
-v3.0 升级：
-- query_rewrite 从规则改写升级为 LLM Multi-Query + 指代消解
-- search_knowledge 接入 HybridRetriever（Multi-Query + HyDE + BM25 + RRF + MMR）
-- 知识库添加接入 DataCleaner + SmartChunker 智能切片
+Agent 工具集定义 v5.1
+支持三种工具来源：
+  1. 本地 Function Calling 工具（@tool 装饰器，通过 bind_tools 绑定到 LLM）
+  2. MCP 工具（通过 langchain-mcp-adapters 加载的外部工具）
+  3. 保留 AgentTools 核心实现（供 @tool 包装器内部调用）
+
+升级说明：
+  v5.0 -> v5.1
+  - search_knowledge 支持 collection_name 参数，未指定时搜索用户所有 collection
+  - add_knowledge 增加内容指纹去重，避免重复入库
 """
-import asyncio
+import hashlib
 import json
 import logging
 import re
 import uuid
-from typing import Optional, List, Dict, Any, Tuple
-from collections import Counter
+from typing import Optional, List, Dict, Any
 
 # 允许在已有事件循环中嵌套运行异步代码（uvicorn + LangChain 同步工具调用场景）
 import nest_asyncio
 nest_asyncio.apply()
 
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.tools import tool
+
 from backend.common.chroma_client import chroma_client
 from backend.common.redis_client import redis_client
 from backend.services.llm_service import llm_service
-from backend.config.settings import settings
 from backend.rag.enhanced_rag import (
     QueryRewriter,
     DataCleaner,
     SmartChunker,
     HybridRetriever,
 )
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# 核心实现层（保留原有逻辑，供 @tool 包装器调用）
+# ============================================================
+
 class AgentTools:
-    """Agent 工具集 - 所有工具方法接收 user_id 作为第一个参数，确保用户隔离"""
+    """Agent 工具核心实现 - 保持原有业务逻辑不变"""
 
     # 类级别的工具调用记录（用于回答"你用了哪些工具"）
     _tool_calls: Dict[str, List[Dict[str, Any]]] = {}
@@ -51,7 +59,6 @@ class AgentTools:
             "output": tool_output[:200] if len(tool_output) > 200 else tool_output,
             "timestamp": str(uuid.uuid4())
         })
-        # 只保留最近 20 次调用
         cls._tool_calls[session_id] = cls._tool_calls[session_id][-20:]
 
     @classmethod
@@ -73,46 +80,21 @@ class AgentTools:
         return f"user_{user_id}_default"
 
     @staticmethod
-    def _bm25_score(query_tokens: List[str], doc: str) -> float:
-        """简易 BM25 关键词匹配评分"""
-        doc_lower = doc.lower()
-        score = 0.0
-        for token in query_tokens:
-            token_lower = token.lower()
-            # 完全匹配加分多，部分匹配加分少
-            if token_lower in doc_lower:
-                score += 1.0
-                # 统计出现次数
-                score += doc_lower.count(token_lower) * 0.3
-        return score
-
-    @staticmethod
-    def _tokenize(text: str) -> List[str]:
-        """简易中文分词：提取中文字符和英文单词"""
-        # 提取中文字符
-        chinese_chars = re.findall(r'[\u4e00-\u9fff]', text)
-        # 提取英文单词
-        english_words = re.findall(r'[a-zA-Z]+', text)
-        return chinese_chars + english_words
-
-    @staticmethod
-    def search_knowledge(user_id: int, query: str, collection_name: Optional[str] = None,
-                         n_results: int = 5, session_id: Optional[str] = None) -> str:
-        """
-        企业级多路召回搜索用户知识库
-        使用 HybridRetriever 执行：Multi-Query改写 + 语义检索 + BM25 + RRF融合 + MMR重排
-        :param user_id: 用户ID
-        :param query: 搜索关键词/问题
-        :param collection_name: 可选的集合名称
-        :param n_results: 返回结果数量
-        :param session_id: 会话ID（用于工具调用追踪）
-        :return: 检索到的知识文本
-        """
+    def _get_user_collections(user_id: int) -> List[str]:
+        """获取用户的所有 collection 名称"""
         try:
-            user_collection = AgentTools._get_user_collection(user_id, collection_name)
-            retriever = HybridRetriever()
+            all_collections = chroma_client.list_collections()
+            prefix = f"user_{user_id}_"
+            return [c for c in all_collections if c.startswith(prefix)]
+        except Exception as e:
+            logger.warning(f"获取用户 collection 列表失败: {e}")
+            return []
 
-            # 使用增强混合检索（同步版本，避免事件循环冲突）
+    @staticmethod
+    def _search_single_collection(query: str, user_collection: str, n_results: int = 5) -> Optional[List[Dict]]:
+        """搜索单个 collection，返回结果列表"""
+        try:
+            retriever = HybridRetriever()
             result = retriever.retrieve_sync(
                 query=query,
                 collection_name=user_collection,
@@ -121,34 +103,11 @@ class AgentTools:
                 use_hyde=False,
                 use_mmr=True,
             )
-
-            if not result or not result.get("results"):
-                result_text = "知识库中未找到相关内容。"
-                if session_id:
-                    AgentTools.record_tool_call(session_id, "search_knowledge",
-                                                {"query": query, "collection": user_collection}, result_text)
-                return result_text
-
-            parts = []
-            for i, item in enumerate(result["results"][:n_results]):
-                source = item.get("metadata", {}).get("filename", f"文档{i+1}")
-                parts.append(f"[来源: {source}]\n{item['doc']}")
-
-            result_text = "\n\n---\n\n".join(parts)
-            retrieval_type = result.get("retrieval_type", "unknown")
-            logger.info(f"知识库检索完成: type={retrieval_type}, results={len(parts)}")
-
-            if session_id:
-                AgentTools.record_tool_call(session_id, "search_knowledge",
-                                            {"query": query, "collection": user_collection}, result_text)
-            return result_text
-
+            if result and result.get("results"):
+                return result["results"]
         except Exception as e:
-            logger.error(f"Search knowledge failed: {e}")
-            # 降级：如果增强检索失败，回退到基础语义检索
-            logger.warning(f"增强检索失败，降级为基础检索: {e}")
+            logger.warning(f"混合检索 {user_collection} 失败，尝试基础检索: {e}")
             try:
-                user_collection = AgentTools._get_user_collection(user_id, collection_name)
                 semantic_results = chroma_client.search(
                     collection_name=user_collection,
                     query_text=query,
@@ -157,74 +116,92 @@ class AgentTools:
                 if semantic_results and semantic_results.get("documents"):
                     docs = semantic_results["documents"][0]
                     metadatas = semantic_results.get("metadatas", [[]])[0]
-                    parts = []
+                    results = []
                     for i, doc in enumerate(docs[:n_results]):
                         meta = metadatas[i] if i < len(metadatas) else {}
-                        source = meta.get("filename", f"文档{i+1}")
-                        parts.append(f"[来源: {source}]\n{doc}")
-                    result_text = "\n\n---\n\n".join(parts)
-                    if session_id:
-                        AgentTools.record_tool_call(session_id, "search_knowledge",
-                                                    {"query": query}, result_text)
-                    return result_text
+                        results.append({
+                            "id": semantic_results.get("ids", [[]])[0][i] if i < len(semantic_results.get("ids", [[]])[0]) else str(i),
+                            "doc": doc,
+                            "metadata": meta,
+                            "score": 1.0,
+                        })
+                    return results
             except Exception as fallback_e:
-                logger.error(f"降级检索也失败: {fallback_e}")
+                logger.error(f"基础检索也失败: {fallback_e}")
+        return None
 
-            error_msg = f"搜索知识库时出错: {str(e)}"
+    @staticmethod
+    def search_knowledge_impl(user_id: int, query: str, n_results: int = 5,
+                              collection_name: Optional[str] = None,
+                              session_id: Optional[str] = None) -> str:
+        """搜索知识库实现（语义+BM25+RRF+MMR 混合检索）
+        如果没有指定 collection_name，会自动搜索用户的所有 collection。
+        """
+        # 确定要搜索的 collection 列表
+        collections_to_search = []
+        if collection_name:
+            collections_to_search = [AgentTools._get_user_collection(user_id, collection_name)]
+        else:
+            user_collections = AgentTools._get_user_collections(user_id)
+            if user_collections:
+                collections_to_search = user_collections
+            else:
+                collections_to_search = [AgentTools._get_user_collection(user_id, None)]
+
+        logger.info(f"知识库搜索: query='{query}', collections={collections_to_search}")
+
+        # 搜索所有 collection，合并结果
+        all_results = []
+        for user_collection in collections_to_search:
+            results = AgentTools._search_single_collection(query, user_collection, n_results)
+            if results:
+                all_results.extend(results)
+
+        if not all_results:
+            result_text = "知识库中未找到相关内容。"
             if session_id:
                 AgentTools.record_tool_call(session_id, "search_knowledge",
-                                            {"query": query}, error_msg)
-            return error_msg
+                                            {"query": query, "collections": collections_to_search}, result_text)
+            return result_text
+
+        # 去重并排序（按 score 降序）
+        seen_docs = set()
+        unique_results = []
+        for item in all_results:
+            doc = item.get("doc", "")
+            doc_key = doc[:150]
+            if doc_key not in seen_docs:
+                seen_docs.add(doc_key)
+                unique_results.append(item)
+
+        unique_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        top_results = unique_results[:n_results]
+
+        parts = []
+        for i, item in enumerate(top_results):
+            source = item.get("metadata", {}).get("filename", f"文档{i+1}")
+            parts.append(f"[来源: {source}]\n{item['doc']}")
+
+        result_text = "\n\n---\n\n".join(parts)
+        logger.info(f"知识库检索完成: collections={collections_to_search}, unique_results={len(unique_results)}, returned={len(top_results)}")
+
+        if session_id:
+            AgentTools.record_tool_call(session_id, "search_knowledge",
+                                        {"query": query, "collections": collections_to_search}, result_text)
+        return result_text
 
     @staticmethod
-    def _rrf_fusion(semantic_results: Optional[Dict], bm25_results: List[Dict], k: int = 60) -> List[Dict]:
-        """RRF 融合排序：结合语义检索和 BM25 结果"""
-        scores = {}
-
-        # 语义检索排名得分
-        if semantic_results and semantic_results.get("documents"):
-            docs = semantic_results["documents"][0] if semantic_results["documents"] else []
-            ids = semantic_results["ids"][0] if semantic_results.get("ids") else []
-            metadatas = semantic_results.get("metadatas", [[]])[0] if semantic_results.get("metadatas") else []
-
-            for rank, (doc_id, doc, meta) in enumerate(zip(ids, docs, metadatas)):
-                if doc_id not in scores:
-                    scores[doc_id] = {"doc": doc, "metadata": meta, "score": 0}
-                scores[doc_id]["score"] += 1.0 / (k + rank + 1)
-
-        # BM25 排名得分
-        for rank, item in enumerate(bm25_results):
-            doc_id = item["id"]
-            if doc_id not in scores:
-                scores[doc_id] = {"doc": item["doc"], "metadata": item["metadata"], "score": 0}
-            scores[doc_id]["score"] += 1.0 / (k + rank + 1)
-
-        # 按融合分数排序
-        sorted_results = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
-        return sorted_results
-
-    @staticmethod
-    def add_knowledge(user_id: int, text: str, collection_name: Optional[str] = None,
-                      session_id: Optional[str] = None) -> str:
-        """
-        添加知识到用户知识库（增强版）
-        使用 DataCleaner 清洗 + SmartChunker 智能切片后批量入库
-        :param user_id: 用户ID
-        :param text: 要添加的知识文本
-        :param collection_name: 可选的集合名称
-        :param session_id: 会话ID（用于工具调用追踪）
-        :return: 添加结果
-        """
+    def add_knowledge_impl(user_id: int, text: str, collection_name: Optional[str] = None,
+                           session_id: Optional[str] = None) -> str:
+        """添加知识到知识库实现（DataCleaner + SmartChunker 智能切片，带去重）"""
         try:
             if not text or not text.strip():
-                result = "错误：保存内容不能为空。请从历史对话中找到具体内容后再保存。"
+                result = "错误：保存内容不能为空。请提供具体内容后再保存。"
                 if session_id:
                     AgentTools.record_tool_call(session_id, "add_knowledge", {"text": text}, result)
                 return result
 
             user_collection = AgentTools._get_user_collection(user_id, collection_name)
-
-            # Step 1: 数据清洗
             cleaned_text = DataCleaner.clean_text(text)
             if not cleaned_text.strip():
                 result = "错误：清洗后内容为空，请提供更有实质内容的文本。"
@@ -232,15 +209,31 @@ class AgentTools:
                     AgentTools.record_tool_call(session_id, "add_knowledge", {"text": text[:100]}, result)
                 return result
 
-            # Step 2: 智能切片
+            # 内容指纹去重：用 MD5 检查是否已存在相同内容
+            content_fingerprint = hashlib.md5(cleaned_text[:2000].encode('utf-8')).hexdigest()
+            try:
+                collection = chroma_client.get_or_create_collection(user_collection)
+                existing = collection.get(ids=[content_fingerprint])
+                if existing and existing.get("ids") and len(existing["ids"]) > 0:
+                    result = "该内容已存在于知识库中，无需重复添加。"
+                    if session_id:
+                        AgentTools.record_tool_call(session_id, "add_knowledge",
+                                                    {"text": text[:100]}, result)
+                    return result
+            except Exception as dup_e:
+                logger.warning(f"去重检查异常，继续添加: {dup_e}")
+
             chunker = SmartChunker(chunk_size=500, chunk_overlap=50)
             chunk_texts, chunk_metadatas = chunker.chunk_documents(
                 [cleaned_text],
                 [{"user_id": str(user_id), "type": "manual_add", "source": "agent_save"}]
             )
 
-            # Step 3: 批量入库
-            chunk_ids = [str(uuid.uuid4()) for _ in chunk_texts]
+            # 第一个切片使用内容指纹作为稳定 ID，其余使用 uuid
+            chunk_ids = [content_fingerprint]
+            if len(chunk_texts) > 1:
+                chunk_ids.extend([str(uuid.uuid4()) for _ in range(len(chunk_texts) - 1)])
+
             chroma_client.add_texts(
                 collection_name=user_collection,
                 texts=chunk_texts,
@@ -248,7 +241,7 @@ class AgentTools:
                 ids=chunk_ids,
             )
 
-            result = f"知识已添加到知识库（collection: {user_collection}, 清洗后 {len(cleaned_text)} 字 -> {len(chunk_texts)} 个 chunk, ids: {chunk_ids[:3]}...）"
+            result = f"知识已添加到知识库（{len(chunk_texts)} 个切片已入库）"
             if session_id:
                 AgentTools.record_tool_call(session_id, "add_knowledge",
                                             {"text": text[:100] + "..." if len(text) > 100 else text}, result)
@@ -262,15 +255,9 @@ class AgentTools:
 
     @staticmethod
     def query_rewrite(original_query: str, history: List[Dict[str, str]] = None) -> str:
-        """
-        查询改写 v2.0：结合指代消解 + LLM Multi-Query 生成更优查询
-        :param original_query: 原始查询
-        :param history: 历史对话（可选）
-        :return: 改写后的查询
-        """
+        """查询改写：结合指代消解 + LLM Multi-Query"""
         query = original_query.strip()
 
-        # Step 1: 指代消解（保留规则引擎处理简单情况）
         pronouns = ["这个", "那个", "刚才", "之前", "上面", "这些", "那些"]
         has_pronoun = any(p in query for p in pronouns)
 
@@ -282,7 +269,6 @@ class AgentTools:
                     query = f"基于之前的讨论（{context}），用户问：{query}"
                     break
 
-        # Step 2: LLM 查询优化（将模糊查询改写为更清晰的检索语句）
         try:
             rewrite_prompt = ChatPromptTemplate.from_messages([
                 ("human", """请将以下用户查询改写为更适合知识库检索的形式。
@@ -296,7 +282,6 @@ class AgentTools:
 原始查询: {query}
 改写后的查询:"""),
             ])
-            from langchain_core.output_parsers import StrOutputParser
             chain = rewrite_prompt | llm_service.llm | StrOutputParser()
             rewritten = chain.invoke({"query": query})
             if rewritten and rewritten.strip():
@@ -305,120 +290,66 @@ class AgentTools:
         except Exception as e:
             logger.warning(f"LLM query rewrite failed, using rule-based result: {e}")
 
-        # Step 3: 保存意图识别
-        save_keywords = ["保存", "记录", "存到", "存入", "加入知识库", "放进知识库"]
-        if any(kw in query for kw in save_keywords):
-            query = f"[保存意图] {query}"
-
         return query
 
-    @staticmethod
-    def calculator(expression: str, session_id: Optional[str] = None) -> str:
-        """
-        数学计算器
-        :param expression: 数学表达式
-        :param session_id: 会话ID（用于工具调用追踪）
-        :return: 计算结果
-        """
+
+# ============================================================
+# LangChain Function Calling 工具（@tool 装饰器）
+# 这些工具通过 bind_tools() 绑定到 LLM，实现原生 Function Calling
+# ============================================================
+
+def create_local_tools(user_id: int, session_id: str):
+    """
+    创建本地 LangChain 工具列表（闭包注入 user_id 和 session_id）
+    返回的 Tool 对象可以通过 bind_tools() 绑定到 LLM
+    """
+    _user_id = user_id
+    _session_id = session_id
+
+    @tool
+    def search_knowledge(query: str, collection_name: str = "", n_results: int = 5) -> str:
+        """搜索用户知识库，使用混合检索（语义+BM25+RRF+MMR）。
+        当用户的问题可能与知识库中保存的笔记、学习内容相关时使用此工具。
+        参数 query 是搜索关键词或问题。
+        参数 collection_name 是知识库名称（可选，不填则搜索用户所有知识库）。
+        参数 n_results 是返回结果数量。"""
+        return AgentTools.search_knowledge_impl(
+            user_id=_user_id,
+            query=query,
+            n_results=n_results,
+            collection_name=collection_name if collection_name.strip() else None,
+            session_id=_session_id,
+        )
+
+    @tool
+    def add_knowledge(text: str, collection_name: str = "") -> str:
+        """将新知识添加到用户的个人知识库。
+        当用户说"保存"、"记录"、"存到知识库"时使用此工具。
+        参数 text 是要保存的完整文本内容（至少50字）。
+        参数 collection_name 是知识库名称（可选，不填则使用默认知识库）。"""
+        return AgentTools.add_knowledge_impl(
+            user_id=_user_id,
+            text=text,
+            collection_name=collection_name if collection_name.strip() else None,
+            session_id=_session_id,
+        )
+
+    @tool
+    def calculator(expression: str) -> str:
+        """数学计算器，计算数学表达式的结果。
+        当用户问数学问题或需要数值计算时使用此工具。
+        参数 expression 是数学表达式，如 '2+3*4'、'(1+2)*3'。"""
         try:
             allowed = set("0123456789+-*/.()^% ")
             if not all(c in allowed for c in expression):
-                result = "错误：表达式包含非法字符。"
-                if session_id:
-                    AgentTools.record_tool_call(session_id, "calculator", {"expression": expression}, result)
-                return result
-
+                return f"错误：表达式 '{expression}' 包含非法字符。"
             safe_expr = expression.replace("^", "**")
             result = eval(safe_expr, {"__builtins__": {}}, {})
-            result_text = f"计算结果: {result}"
-            if session_id:
-                AgentTools.record_tool_call(session_id, "calculator", {"expression": expression}, result_text)
-            return result_text
+            AgentTools.record_tool_call(_session_id, "calculator", {"expression": expression}, f"计算结果: {result}")
+            return f"计算结果: {result}"
         except Exception as e:
             error_msg = f"计算错误: {str(e)}"
-            if session_id:
-                AgentTools.record_tool_call(session_id, "calculator", {"expression": expression}, error_msg)
+            AgentTools.record_tool_call(_session_id, "calculator", {"expression": expression}, error_msg)
             return error_msg
 
-    @staticmethod
-    def get_conversation_history(user_id: int, session_id: str, limit: int = 10) -> str:
-        """
-        获取对话历史
-        :param user_id: 用户ID
-        :param session_id: 会话ID
-        :param limit: 返回最近几条记录
-        :return: 格式化的对话历史
-        """
-        try:
-            key = f"agent:history:{user_id}:{session_id}"
-            history_raw = redis_client.client.lrange(key, -limit, -1)
-            if not history_raw:
-                return "暂无对话历史。"
-
-            parts = []
-            for item in history_raw:
-                try:
-                    msg = json.loads(item)
-                    role = msg.get("role", "unknown")
-                    content = msg.get("content", "")
-                    parts.append(f"[{role}] {content}")
-                except:
-                    continue
-
-            return "\n".join(parts) if parts else "暂无对话历史。"
-        except Exception as e:
-            logger.error(f"Get history failed: {e}")
-            return f"获取历史失败: {str(e)}"
-
-    @staticmethod
-    def get_used_tools(session_id: str) -> str:
-        """
-        获取当前会话已使用的工具列表
-        :param session_id: 会话ID
-        :return: 工具使用记录文本
-        """
-        calls = AgentTools.get_tool_calls(session_id)
-        if not calls:
-            return "本次对话中尚未使用任何工具。"
-
-        parts = [f"本次对话已使用 {len(calls)} 个工具："]
-        for i, call in enumerate(calls, 1):
-            parts.append(f"{i}. {call['tool']}: {call['output'][:100]}...")
-        return "\n".join(parts)
-
-    @staticmethod
-    def web_search_placeholder(query: str, session_id: Optional[str] = None) -> str:
-        """
-        联网搜索（占位实现）
-        """
-        result = (
-            f"[联网搜索占位] 搜索关键词: '{query}'\n"
-            "注意：当前未接入真实搜索引擎。"
-        )
-        if session_id:
-            AgentTools.record_tool_call(session_id, "web_search_placeholder", {"query": query}, result)
-        return result
-
-
-# 工具描述，用于 Agent Prompt
-TOOLS_DESCRIPTION = """
-1. search_knowledge(user_id, query, collection_name=None, n_results=5)
-   - 搜索用户知识库（自动使用BM25+语义多路召回）
-   - 当用户问题可能与知识库有关时使用
-
-2. add_knowledge(user_id, text, collection_name=None)
-   - 将新知识添加到用户知识库
-   - 当用户要求保存/记录信息时使用，text参数必须传入完整内容
-
-3. calculator(expression)
-   - 数学计算器
-   - 当用户问数学问题或需要计算时使用
-
-4. get_used_tools(session_id)
-   - 查看本次对话已使用的工具列表
-   - 当用户问"你用了什么工具"时使用
-
-5. web_search_placeholder(query)
-   - 联网搜索（占位实现）
-   - 当知识库中没有答案且需要外部信息时使用
-"""
+    return [search_knowledge, add_knowledge, calculator]

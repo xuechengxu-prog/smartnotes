@@ -8,7 +8,7 @@
     <div class="auth-card">
       <div class="auth-header">
         <div class="logo">
-          <el-icon size="40" color="#00f0ff"><Document /></el-icon>
+          <el-icon size="40" color="#6366f1"><Document /></el-icon>
         </div>
         <h1>SmartNotes</h1>
         <p class="subtitle">智能学习助手</p>
@@ -100,7 +100,7 @@ const handleLogin = async () => {
   justify-content: center;
   position: relative;
   overflow: hidden;
-  background: #0a0e1a;
+  background: #f0f4f8;
 }
 
 .auth-bg {
@@ -113,8 +113,8 @@ const handleLogin = async () => {
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(0, 240, 255, 0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0, 240, 255, 0.03) 1px, transparent 1px);
+    linear-gradient(rgba(99, 102, 241, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(99, 102, 241, 0.03) 1px, transparent 1px);
   background-size: 50px 50px;
 }
 
@@ -128,7 +128,7 @@ const handleLogin = async () => {
 .orb-1 {
   width: 400px;
   height: 400px;
-  background: radial-gradient(circle, #00f0ff, transparent 70%);
+  background: radial-gradient(circle, #6366f1, transparent 70%);
   top: -100px;
   right: -100px;
 }
@@ -136,7 +136,7 @@ const handleLogin = async () => {
 .orb-2 {
   width: 300px;
   height: 300px;
-  background: radial-gradient(circle, #7c3aed, transparent 70%);
+  background: radial-gradient(circle, #8b5cf6, transparent 70%);
   bottom: -80px;
   left: -80px;
 }
@@ -146,13 +146,13 @@ const handleLogin = async () => {
   z-index: 1;
   width: 420px;
   padding: 48px 40px;
-  background: rgba(15, 23, 42, 0.8);
-  border: 1px solid rgba(0, 240, 255, 0.15);
+  background: #f8fafc;
+  border: 1px solid rgba(99, 102, 241, 0.15);
   border-radius: 16px;
   backdrop-filter: blur(20px);
   box-shadow:
-    0 0 40px rgba(0, 240, 255, 0.08),
-    0 20px 60px rgba(0, 0, 0, 0.5);
+    0 0 40px rgba(99, 102, 241, 0.08),
+    0 20px 60px rgba(0, 0, 0, 0.08);
 }
 
 .auth-header {
@@ -167,15 +167,15 @@ const handleLogin = async () => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 240, 255, 0.1);
+  background: rgba(99, 102, 241, 0.1);
   border-radius: 16px;
-  border: 1px solid rgba(0, 240, 255, 0.2);
+  border: 1px solid rgba(99, 102, 241, 0.2);
 }
 
 .auth-header h1 {
   font-size: 28px;
   font-weight: 700;
-  color: #fff;
+  color: #1e293b;
   margin: 0 0 8px;
   letter-spacing: 2px;
 }
@@ -187,13 +187,13 @@ const handleLogin = async () => {
 }
 
 .auth-form :deep(.el-input__wrapper) {
-  background: rgba(30, 41, 59, 0.6);
+  background: #ffffff;
   box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.2) inset;
   border-radius: 10px;
 }
 
 .auth-form :deep(.el-input__inner) {
-  color: #e2e8f0;
+  color: #1e293b;
 }
 
 .auth-form :deep(.el-input__inner::placeholder) {
@@ -207,7 +207,7 @@ const handleLogin = async () => {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: 2px;
-  background: linear-gradient(135deg, #00f0ff 0%, #7c3aed 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   border: none;
   border-radius: 10px;
   transition: all 0.3s ease;
@@ -215,7 +215,7 @@ const handleLogin = async () => {
 
 .auth-btn:hover {
   transform: translateY(-1px);
-  box-shadow: 0 8px 25px rgba(0, 240, 255, 0.3);
+  box-shadow: 0 8px 25px rgba(99, 102, 241, 0.3);
 }
 
 .auth-footer {
@@ -226,7 +226,7 @@ const handleLogin = async () => {
 }
 
 .link {
-  color: #00f0ff;
+  color: #6366f1;
   text-decoration: none;
   margin-left: 4px;
   font-weight: 500;

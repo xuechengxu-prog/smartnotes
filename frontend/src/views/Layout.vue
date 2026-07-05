@@ -19,7 +19,7 @@ import Header from '@/components/Header.vue'
 .layout {
   display: flex;
   min-height: 100vh;
-  background: #0a0e1a;
+  background: #f0f4f8;
 }
 
 .main {

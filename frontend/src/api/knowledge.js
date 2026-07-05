@@ -25,3 +25,25 @@ export const searchKnowledge = (params) => {
     params
   })
 }
+
+/**
+ * 获取用户所有知识库 collection 列表
+ */
+export const getCollections = () => {
+  return request({
+    url: '/knowledge/collections',
+    method: 'get',
+  })
+}
+
+/**
+ * 创建新的知识库 collection
+ * @param {Object} data - { collection_name: string }
+ */
+export const createCollection = (data) => {
+  return request({
+    url: '/knowledge/collections',
+    method: 'post',
+    data,
+  })
+}

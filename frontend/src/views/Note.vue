@@ -32,7 +32,7 @@
 
     <div v-if="result || streaming" class="result-section">
       <div class="result-header">
-        <el-icon size="18" color="#00f0ff"><DocumentChecked /></el-icon>
+        <el-icon size="18" color="#6366f1"><DocumentChecked /></el-icon>
         <span>整理结果</span>
         <span v-if="streaming" class="typing-indicator">
           <span class="dot"></span>
@@ -136,9 +136,9 @@ const copyResult = () => {
 }
 
 .dark-textarea :deep(.el-textarea__inner) {
-  background: rgba(15, 23, 42, 0.6);
-  border: 1px solid rgba(0, 240, 255, 0.15);
-  color: #e2e8f0;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  color: #1e293b;
   font-size: 14px;
   line-height: 1.8;
   border-radius: 12px;
@@ -150,8 +150,8 @@ const copyResult = () => {
 }
 
 .dark-textarea :deep(.el-textarea__inner:focus) {
-  border-color: rgba(0, 240, 255, 0.4);
-  box-shadow: 0 0 15px rgba(0, 240, 255, 0.08);
+  border-color: rgba(99, 102, 241, 0.4);
+  box-shadow: 0 0 15px rgba(99, 102, 241, 0.08);
 }
 
 .actions {
@@ -166,7 +166,7 @@ const copyResult = () => {
 }
 
 .actions .el-button--primary {
-  background: linear-gradient(135deg, #00f0ff 0%, #7c3aed 100%);
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   border: none;
 }
 
@@ -175,10 +175,11 @@ const copyResult = () => {
 }
 
 .result-section {
-  background: rgba(15, 23, 42, 0.5);
-  border: 1px solid rgba(0, 240, 255, 0.12);
+  background: #ffffff;
+  border: 1px solid rgba(99, 102, 241, 0.12);
   border-radius: 12px;
   overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
 }
 
 .result-header {
@@ -186,11 +187,11 @@ const copyResult = () => {
   align-items: center;
   gap: 8px;
   padding: 14px 18px;
-  background: rgba(0, 240, 255, 0.05);
-  border-bottom: 1px solid rgba(0, 240, 255, 0.1);
+  background: rgba(99, 102, 241, 0.05);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.1);
   font-size: 14px;
   font-weight: 600;
-  color: #e2e8f0;
+  color: #1e293b;
 }
 
 .typing-indicator {
@@ -202,7 +203,7 @@ const copyResult = () => {
 .dot {
   width: 6px;
   height: 6px;
-  background: #00f0ff;
+  background: #6366f1;
   border-radius: 50%;
   animation: bounce 1.4s infinite ease-in-out both;
 }
@@ -221,7 +222,7 @@ const copyResult = () => {
 
 /* Markdown 渲染样式 */
 :deep(.markdown-body) {
-  color: #cbd5e1;
+  color: #475569;
   font-size: 14px;
   line-height: 1.8;
 }
@@ -232,10 +233,10 @@ const copyResult = () => {
 :deep(.markdown-body h4),
 :deep(.markdown-body h5),
 :deep(.markdown-body h6) {
-  color: #e2e8f0;
+  color: #1e293b;
   margin: 16px 0 10px;
   font-weight: 600;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.1);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.1);
   padding-bottom: 6px;
 }
 
@@ -245,11 +246,11 @@ const copyResult = () => {
 
 :deep(.markdown-body p) {
   margin: 8px 0;
-  color: #cbd5e1;
+  color: #475569;
 }
 
 :deep(.markdown-body strong) {
-  color: #00f0ff;
+  color: #6366f1;
   font-weight: 600;
 }
 
@@ -264,8 +265,8 @@ const copyResult = () => {
 }
 
 :deep(.markdown-body code) {
-  background: rgba(0, 240, 255, 0.08);
-  color: #00f0ff;
+  background: rgba(99, 102, 241, 0.08);
+  color: #6366f1;
   padding: 2px 6px;
   border-radius: 4px;
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
@@ -273,8 +274,8 @@ const copyResult = () => {
 }
 
 :deep(.markdown-body pre) {
-  background: rgba(15, 23, 42, 0.8);
-  border: 1px solid rgba(0, 240, 255, 0.1);
+  background: #f8fafc;
+  border: 1px solid rgba(99, 102, 241, 0.1);
   border-radius: 8px;
   padding: 12px 16px;
   overflow-x: auto;
@@ -284,14 +285,14 @@ const copyResult = () => {
 :deep(.markdown-body pre code) {
   background: transparent;
   padding: 0;
-  color: #a5b4fc;
+  color: #818cf8;
 }
 
 :deep(.markdown-body blockquote) {
-  border-left: 3px solid rgba(0, 240, 255, 0.3);
+  border-left: 3px solid rgba(99, 102, 241, 0.3);
   margin: 10px 0;
   padding: 8px 16px;
-  background: rgba(0, 240, 255, 0.03);
+  background: rgba(99, 102, 241, 0.03);
   border-radius: 0 8px 8px 0;
 }
 
@@ -302,7 +303,7 @@ const copyResult = () => {
 
 :deep(.markdown-body hr) {
   border: none;
-  border-top: 1px solid rgba(0, 240, 255, 0.1);
+  border-top: 1px solid rgba(99, 102, 241, 0.1);
   margin: 16px 0;
 }
 
@@ -314,16 +315,16 @@ const copyResult = () => {
 }
 
 :deep(.markdown-body th) {
-  background: rgba(0, 240, 255, 0.06);
-  color: #e2e8f0;
+  background: rgba(99, 102, 241, 0.06);
+  color: #1e293b;
   padding: 8px 12px;
   text-align: left;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.15);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.15);
 }
 
 :deep(.markdown-body td) {
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(0, 240, 255, 0.08);
-  color: #cbd5e1;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.08);
+  color: #475569;
 }
 </style>

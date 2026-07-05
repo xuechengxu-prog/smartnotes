@@ -1,14 +1,12 @@
 """
-问答 Agent 服务 - v3.0 ReAct Agent
-提供智能问答 API，基于 ReAct Agent 架构
-支持工具调用、对话记忆、流式输出
-优化项：
-  1. 知识库按用户隔离（collection_name 绑定 user_id）
-  2. LLM 缓存 key 包含模型版本
-  3. ChromaDB 批量写入
-  4. 删除时同步清理 ChromaDB
-  5. ReAct Agent 工具调用
-  6. Redis 持久化对话记忆
+问答 Agent 服务 - v5.0 ReAct Agent + Function Calling + MCP
+提供智能问答 API，基于 LangGraph + MCP 架构
+支持工具调用（本地 Function Calling + MCP 外部工具）、对话记忆、流式输出
+
+v5.0 升级：
+  1. ReAct Prompt + Function Calling（LangGraph StateGraph + bind_tools）
+  2. MCP 工具集成（联网搜索、学习辅助）
+  3. 工具来源统一管理（本地 @tool + MCP adapters）
 """
 import hashlib
 import json
@@ -24,7 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from backend.agent_qa.agent_core import create_agent
-from backend.agent_qa.tools import AgentTools, TOOLS_DESCRIPTION
+from backend.agent_qa.tools import AgentTools
 from backend.chains.qa_chain import qa_chain
 from backend.common.redis_client import redis_client
 from backend.common.chroma_client import chroma_client
@@ -37,6 +35,93 @@ from backend.config.settings import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# MCP 工具管理器
+# ============================================================
+
+class MCPToolManager:
+    """管理 MCP Server 连接和工具加载"""
+
+    _instance: Optional["MCPToolManager"] = None
+    _mcp_tools: list = []
+    _initialized: bool = False
+
+    def __new__(cls) -> "MCPToolManager":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    async def initialize(self):
+        """初始化 MCP 连接，加载外部工具（带重试）"""
+        if self._initialized:
+            return
+
+        try:
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+            import asyncio
+
+            mcp_servers = {}
+
+            if settings.WEB_SEARCH_MCP_URL:
+                mcp_servers["web_search"] = {
+                    "url": settings.WEB_SEARCH_MCP_URL,
+                    "transport": "streamable_http",
+                }
+
+            if settings.SMARTNOTES_MCP_URL:
+                mcp_servers["smartnotes_learning"] = {
+                    "url": settings.SMARTNOTES_MCP_URL,
+                    "transport": "streamable_http",
+                }
+
+            if mcp_servers:
+                # 最多重试 3 次，每次间隔 3 秒（等待 MCP Server 就绪）
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        self._client = MultiServerMCPClient(mcp_servers)
+                        self._mcp_tools = await self._client.get_tools()
+                        tool_names = [t.name for t in self._mcp_tools]
+                        logger.info(f"MCP 工具加载成功: {tool_names}")
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logger.info(f"MCP 连接第 {attempt+1} 次失败，{3}秒后重试...")
+                            await asyncio.sleep(3)
+                        else:
+                            import traceback
+                            logger.warning(f"MCP 工具加载失败（将仅使用本地工具）: {e}\n{traceback.format_exc()}")
+                            self._mcp_tools = []
+            else:
+                logger.info("未配置 MCP Server，仅使用本地 Function Calling 工具")
+
+        except ImportError:
+            logger.warning("langchain-mcp-adapters 未安装，将仅使用本地工具")
+            self._mcp_tools = []
+        except Exception as e:
+            logger.warning(f"MCP 初始化失败: {e}")
+            self._mcp_tools = []
+
+        self._initialized = True
+
+    async def close(self):
+        """关闭 MCP 连接"""
+        if hasattr(self, '_client'):
+            try:
+                await self._client.close()
+            except:
+                pass
+        self._initialized = False
+        self._mcp_tools = []
+
+    @property
+    def mcp_tools(self) -> list:
+        return self._mcp_tools
+
+
+mcp_manager = MCPToolManager()
 
 
 # ============================================================
@@ -59,20 +144,16 @@ class QAResponse(BaseModel):
     thoughts: List[str] = Field([], description="Agent 思考过程")
     actions: List[dict] = Field([], description="Agent 执行的工具调用")
     used_tools: List[str] = Field([], description="本次对话使用的工具列表")
-    source: str = Field("", description="回答来源: knowledge_base 或 llm")
+    source: str = Field("", description="回答来源: knowledge_base / llm / web_search")
 
 
 class KnowledgeAddTextRequest(BaseModel):
     text: str = Field(..., min_length=1, description="要添加的文本内容")
-    collection_name: Optional[str] = Field(None, description="集合名称（可选，不传则自动使用 user_id 隔离）")
+    collection_name: Optional[str] = Field(None, description="集合名称（可选）")
 
 
 class KnowledgeSearchResponse(BaseModel):
     results: list = Field(..., description="搜索结果列表")
-
-
-class KnowledgeListResponse(BaseModel):
-    items: list = Field(..., description="知识库条目列表")
 
 
 # ============================================================
@@ -82,25 +163,25 @@ class KnowledgeListResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    logger.info("Agent QA starting up...")
+    logger.info("Agent QA v5.0 starting up...")
     await redis_client.connect()
     await init_database()
-    logger.info("Agent QA started.")
+    await mcp_manager.initialize()
+    logger.info("Agent QA v5.0 started (ReAct + Function Calling + MCP).")
     yield
     logger.info("Agent QA shutting down...")
+    await mcp_manager.close()
     await close_database()
     await redis_client.close()
     logger.info("Agent QA stopped.")
 
 
 app = FastAPI(
-    title="SmartNotes - QA Agent",
-    description="问答 Agent 服务（ReAct Agent + 工具调用 + 对话记忆）",
-    version="3.0.0",
+    title="SmartNotes - QA Agent v5.0",
+    description="问答 Agent 服务（ReAct Prompt + Function Calling + MCP）",
+    version="5.0.0",
     lifespan=lifespan,
 )
-
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -115,20 +196,17 @@ app.add_middleware(
 # ============================================================
 
 def _get_user_collection(user_id: int, collection_name: Optional[str] = None) -> str:
-    """获取用户隔离的 collection 名称"""
     if collection_name:
         return f"user_{user_id}_{collection_name}"
     return f"user_{user_id}_default"
 
 
 def _generate_cache_key(question: str, context: Optional[str] = None) -> str:
-    """生成缓存 key（包含模型版本，避免模型升级后缓存失效）"""
     key_content = f"qa:{settings.LLM_MODEL}:{question}:{context or ''}"
     return hashlib.md5(key_content.encode()).hexdigest()
 
 
 def _build_context_from_search_results(results: dict) -> str:
-    """将 ChromaDB 搜索结果拼接为上下文字符串"""
     if not results or not results.get("documents"):
         return ""
     documents = results["documents"]
@@ -143,7 +221,6 @@ def _build_context_from_search_results(results: dict) -> str:
 
 
 async def _save_qa_to_chromadb(user_id: int, question: str, answer: str):
-    """将 QA 问答结果存入 ChromaDB 向量数据库（使用用户隔离 collection）"""
     try:
         qa_text = f"问题：{question}\n\n回答：{answer}"
         item_id = f"qa_{user_id}_{uuid.uuid4().hex[:8]}"
@@ -154,66 +231,59 @@ async def _save_qa_to_chromadb(user_id: int, question: str, answer: str):
             metadatas=[{"user_id": str(user_id), "type": "qa_record", "question": question[:200]}],
             ids=[item_id],
         )
-        logger.info(f"QA saved to ChromaDB: {item_id} in collection: {collection}")
     except Exception as e:
         logger.error(f"Failed to save QA to ChromaDB: {e}")
 
 
 def _parse_file_content(filename: str, content: bytes) -> str:
-    """解析上传文件内容"""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-
     if ext in ("txt", "md"):
         try:
             return content.decode("utf-8")
         except UnicodeDecodeError:
             return content.decode("gbk", errors="ignore")
     elif ext == "pdf":
-        raise HTTPException(
-            status_code=400,
-            detail="PDF 文件解析需要安装额外依赖（如 pdfplumber），当前暂不支持",
-        )
+        raise HTTPException(status_code=400, detail="PDF 解析需要额外依赖，当前暂不支持")
     elif ext == "docx":
-        raise HTTPException(
-            status_code=400,
-            detail="DOCX 文件解析需要安装额外依赖（如 python-docx），当前暂不支持",
-        )
+        raise HTTPException(status_code=400, detail="DOCX 解析需要额外依赖，当前暂不支持")
     else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"不支持的文件格式: .{ext}，当前仅支持 .txt 和 .md",
-        )
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式: .{ext}")
 
 
 # ============================================================
-# 问答路由 - ReAct Agent 模式
+# 问答路由 - Agent 模式 (ReAct + Function Calling + MCP)
 # ============================================================
 
 @app.post("/ask", response_model=QAResponse)
 async def ask_question(request: QARequest, x_user_id: int = Header(...)):
-    """
-    问答（非流式）
-    支持两种模式：
-    - use_agent=true: ReAct Agent 模式（工具调用 + 自主决策）
-    - use_agent=false: 传统 RAG 模式（直接检索 + 生成）
-    """
+    """问答（非流式）- Agent 模式自动使用 Function Calling + MCP 工具"""
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
 
-    # Agent 模式
     if request.use_agent:
-        agent = await create_agent(user_id=x_user_id, session_id=request.session_id)
+        agent = await create_agent(
+            user_id=x_user_id,
+            session_id=request.session_id,
+            mcp_tools=mcp_manager.mcp_tools,
+        )
         result = await agent.run(request.question)
+
+        # 判断来源
+        source = result.get("source", "llm")
+        if any("web_search" in t or "search_and_summarize" in t or "get_web_content" in t
+               for t in result.get("used_tools", [])):
+            source = "web_search"
+
         return QAResponse(
             answer=result["answer"],
             session_id=result["session_id"],
             thoughts=result.get("thoughts", []),
             actions=result.get("actions", []),
             used_tools=result.get("used_tools", []),
-            source=result.get("source", ""),
+            source=source,
         )
 
-    # 传统 RAG 模式（保持向后兼容）
+    # 传统 RAG 模式（向后兼容）
     cache_key = None
     cache_hit = False
     answer = None
@@ -229,7 +299,7 @@ async def ask_question(request: QARequest, x_user_id: int = Header(...)):
             )
             context = _build_context_from_search_results(search_results)
         except Exception as e:
-            logger.warning(f"ChromaDB search failed, fallback to normal QA: {e}")
+            logger.warning(f"ChromaDB search failed: {e}")
             context = ""
 
     if request.use_cache:
@@ -256,30 +326,25 @@ async def ask_question(request: QARequest, x_user_id: int = Header(...)):
             await redis_client.cache_set(cache_key, answer, ttl=settings.CACHE_TTL)
 
     await _save_qa_to_chromadb(x_user_id, request.question, answer)
-
     return QAResponse(answer=answer, cache_hit=cache_hit)
 
 
 @app.post("/ask/stream")
 async def ask_question_stream(request: QARequest, x_user_id: int = Header(...)):
-    """
-    问答（流式输出）
-    支持两种模式：
-    - use_agent=true: ReAct Agent 流式模式（实时显示 Thought/Action/Observation）
-    - use_agent=false: 传统 RAG 流式模式
-    """
+    """问答（流式输出）- Agent 模式实时展示 Thought/Action/Observation"""
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
 
-    # Agent 流式模式
     if request.use_agent:
-        agent = await create_agent(user_id=x_user_id, session_id=request.session_id)
+        agent = await create_agent(
+            user_id=x_user_id,
+            session_id=request.session_id,
+            mcp_tools=mcp_manager.mcp_tools,
+        )
 
         async def agent_stream():
-            # 先发送 session_id 给前端
             yield f"data: {json.dumps({'type': 'session_id', 'session_id': agent.session_id}, ensure_ascii=False)}\n\n"
             async for event in agent.run_stream(request.question):
-                # 将事件格式化为 SSE 风格的数据
                 event_json = json.dumps(event, ensure_ascii=False)
                 yield f"data: {event_json}\n\n"
             yield "data: [DONE]\n\n"
@@ -293,7 +358,7 @@ async def ask_question_stream(request: QARequest, x_user_id: int = Header(...)):
             },
         )
 
-    # 传统 RAG 流式模式（保持向后兼容）
+    # 传统 RAG 流式模式（向后兼容）
     context = request.context
     if not context:
         try:
@@ -305,7 +370,7 @@ async def ask_question_stream(request: QARequest, x_user_id: int = Header(...)):
             )
             context = _build_context_from_search_results(search_results)
         except Exception as e:
-            logger.warning(f"ChromaDB search failed, fallback to normal QA: {e}")
+            logger.warning(f"ChromaDB search failed: {e}")
             context = ""
 
     answer_parts = []
@@ -336,7 +401,7 @@ async def ask_question_stream(request: QARequest, x_user_id: int = Header(...)):
 
 
 # ============================================================
-# 知识库路由（保持不变）
+# 知识库路由
 # ============================================================
 
 @app.post("/knowledge/add/text")
@@ -344,27 +409,40 @@ async def add_text_to_knowledge(
     request: KnowledgeAddTextRequest,
     x_user_id: int = Header(...),
 ):
-    """添加文本到知识库（增强版：数据清洗 + 智能切片）"""
+    """添加文本到知识库（增强版：数据清洗 + 智能切片 + 去重）"""
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="文本内容不能为空")
 
     try:
         user_collection = _get_user_collection(x_user_id, request.collection_name)
-
-        # Step 1: 数据清洗
         cleaned_text = DataCleaner.clean_text(request.text)
         if not cleaned_text.strip():
-            raise HTTPException(status_code=400, detail="清洗后文本内容为空，请提供更有实质内容的文本")
+            raise HTTPException(status_code=400, detail="清洗后文本内容为空")
 
-        # Step 2: 智能切片
+        # 内容指纹去重
+        content_fingerprint = hashlib.md5(cleaned_text[:2000].encode('utf-8')).hexdigest()
+        try:
+            collection = chroma_client.get_or_create_collection(user_collection)
+            existing = collection.get(ids=[content_fingerprint])
+            if existing and existing.get("ids") and len(existing["ids"]) > 0:
+                return {
+                    "message": "该内容已存在于知识库中，无需重复添加。",
+                    "duplicate": True,
+                    "collection_name": user_collection,
+                }
+        except Exception as dup_e:
+            logger.warning(f"去重检查异常，继续添加: {dup_e}")
+
         chunker = SmartChunker(chunk_size=500, chunk_overlap=50)
         chunk_texts, chunk_metadatas = chunker.chunk_documents(
             [cleaned_text],
             [{"user_id": str(x_user_id), "source": "text_upload"}]
         )
 
-        # Step 3: 批量入库
-        item_ids = [str(uuid.uuid4()) for _ in chunk_texts]
+        # 第一个切片使用指纹 ID，其余使用 uuid
+        item_ids = [content_fingerprint]
+        if len(chunk_texts) > 1:
+            item_ids.extend([str(uuid.uuid4()) for _ in range(len(chunk_texts) - 1)])
 
         try:
             chroma_client.add_texts(
@@ -375,7 +453,7 @@ async def add_text_to_knowledge(
             )
         except Exception as e:
             logger.error(f"ChromaDB add_texts failed: {e}")
-            raise HTTPException(status_code=503, detail=f"知识库服务暂时不可用（嵌入模型可能还在加载中），请稍后重试。错误: {str(e)}")
+            raise HTTPException(status_code=503, detail=f"知识库服务暂时不可用，请稍后重试。错误: {str(e)}")
 
         session = await get_db_session()
         try:
@@ -414,7 +492,7 @@ async def add_file_to_knowledge(
     collection_name: Optional[str] = Query(None, description="集合名称"),
     x_user_id: int = Header(...),
 ):
-    """上传文件到知识库（增强版：数据清洗 + 智能切片）"""
+    """上传文件到知识库（增强版：数据清洗 + 智能切片 + 去重）"""
     try:
         content_bytes = await file.read()
         if not content_bytes:
@@ -423,20 +501,34 @@ async def add_file_to_knowledge(
         text_content = _parse_file_content(file.filename, content_bytes)
         user_collection = _get_user_collection(x_user_id, collection_name)
 
-        # Step 1: 数据清洗
         cleaned_text = DataCleaner.clean_text(text_content)
         if not cleaned_text.strip():
             raise HTTPException(status_code=400, detail="文件清洗后内容为空")
 
-        # Step 2: 智能切片
+        # 内容指纹去重
+        content_fingerprint = hashlib.md5(cleaned_text[:2000].encode('utf-8')).hexdigest()
+        try:
+            collection = chroma_client.get_or_create_collection(user_collection)
+            existing = collection.get(ids=[content_fingerprint])
+            if existing and existing.get("ids") and len(existing["ids"]) > 0:
+                return {
+                    "message": f"文件 '{file.filename}' 的内容已存在于知识库中，无需重复添加。",
+                    "duplicate": True,
+                    "collection_name": user_collection,
+                }
+        except Exception as dup_e:
+            logger.warning(f"去重检查异常，继续添加: {dup_e}")
+
         chunker = SmartChunker(chunk_size=500, chunk_overlap=50)
         chunk_texts, chunk_metadatas = chunker.chunk_documents(
             [cleaned_text],
             [{"user_id": str(x_user_id), "filename": file.filename, "source": "file_upload"}]
         )
 
-        # Step 3: 批量入库
-        item_ids = [str(uuid.uuid4()) for _ in chunk_texts]
+        # 第一个切片使用指纹 ID，其余使用 uuid
+        item_ids = [content_fingerprint]
+        if len(chunk_texts) > 1:
+            item_ids.extend([str(uuid.uuid4()) for _ in range(len(chunk_texts) - 1)])
 
         chroma_client.add_texts(
             collection_name=user_collection,
@@ -477,6 +569,56 @@ async def add_file_to_knowledge(
         raise HTTPException(status_code=500, detail=f"添加文件失败: {str(e)}")
 
 
+@app.get("/knowledge/collections")
+async def list_user_collections(x_user_id: int = Header(...)):
+    """列出当前用户的所有知识库 collection 名称"""
+    try:
+        all_collections = chroma_client.list_collections()
+        prefix = f"user_{x_user_id}_"
+        user_collections = []
+        for c in all_collections:
+            if c.startswith(prefix):
+                # 提取 collection_name 部分：user_{id}_{name} -> {name}
+                name = c[len(prefix):]
+                user_collections.append(name)
+        # 始终包含 default
+        if "default" not in user_collections:
+            user_collections.insert(0, "default")
+        return {"collections": user_collections}
+    except Exception as e:
+        logger.error(f"List collections failed: {e}")
+        return {"collections": ["default"]}
+
+
+class CreateCollectionRequest(BaseModel):
+    collection_name: str = Field(..., min_length=1, max_length=100, description="知识库名称")
+
+
+@app.post("/knowledge/collections")
+async def create_collection(
+    request: CreateCollectionRequest,
+    x_user_id: int = Header(...),
+):
+    """创建新的知识库 collection（预创建空 collection）"""
+    name = request.collection_name.strip()
+    # 验证名称格式
+    valid_name_regex = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*[a-zA-Z0-9]$')
+    if not valid_name_regex.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="知识库名称只能包含字母、数字、下划线、中划线，且不能以特殊字符开头或结尾"
+        )
+
+    user_collection = _get_user_collection(x_user_id, name)
+    try:
+        # 预创建 collection（如果已存在则返回已有）
+        chroma_client.get_or_create_collection(user_collection)
+        return {"message": f"知识库 '{name}' 创建成功", "collection_name": name}
+    except Exception as e:
+        logger.error(f"Create collection failed: {e}")
+        raise HTTPException(status_code=500, detail=f"创建知识库失败: {str(e)}")
+
+
 @app.get("/knowledge/search", response_model=KnowledgeSearchResponse)
 async def search_knowledge(
     query: str = Query(..., min_length=1, description="搜索关键词"),
@@ -495,8 +637,7 @@ async def search_knowledge(
                 n_results=n_results,
             )
         except Exception as e:
-            logger.warning(f"ChromaDB search failed (model may not be ready): {e}")
-            # 嵌入模型可能还在下载中，返回空结果而不是 500
+            logger.warning(f"ChromaDB search failed: {e}")
             return KnowledgeSearchResponse(results=[])
 
         formatted = []
@@ -525,10 +666,7 @@ async def search_knowledge(
 
 
 @app.delete("/knowledge/{item_id}")
-async def delete_knowledge_item(
-    item_id: int,
-    x_user_id: int = Header(...),
-):
+async def delete_knowledge_item(item_id: int, x_user_id: int = Header(...)):
     """删除知识库条目"""
     try:
         session = await get_db_session()
@@ -546,7 +684,6 @@ async def delete_knowledge_item(
             try:
                 collection = chroma_client.get_or_create_collection(item.collection_name)
                 collection.delete(ids=[item.chroma_id])
-                logger.info(f"Deleted chroma_id {item.chroma_id} from collection {item.collection_name}")
             except Exception as ce:
                 logger.warning(f"Failed to delete from ChromaDB: {ce}")
 
@@ -573,7 +710,6 @@ async def list_sessions(x_user_id: int = Header(...)):
     """列出用户的所有会话"""
     try:
         pattern = f"agent:history:{x_user_id}:*"
-        # 使用 SCAN 替代 KEYS，避免阻塞 Redis
         keys = []
         cursor = 0
         while True:
@@ -587,7 +723,6 @@ async def list_sessions(x_user_id: int = Header(...)):
             if len(parts) >= 4:
                 session_id = parts[3]
                 length = await redis_client.client.llen(key)
-                # 提取会话标题：取第一条用户消息的前30个字符
                 title = ""
                 if length > 0:
                     first_msg_raw = await redis_client.client.lindex(key, 0)
@@ -599,7 +734,6 @@ async def list_sessions(x_user_id: int = Header(...)):
                                 title = content[:30] + ('...' if len(content) > 30 else '')
                         except Exception as e:
                             logger.error(f"Parse session title failed: {e}")
-                # 读取 session meta 获取 updated_at
                 meta_key = f"agent:session_meta:{x_user_id}:{session_id}"
                 meta_data = await redis_client.client.hgetall(meta_key)
                 updated_at = float(meta_data.get("updated_at", 0)) if meta_data else 0
@@ -612,7 +746,6 @@ async def list_sessions(x_user_id: int = Header(...)):
         return {"sessions": sessions}
     except Exception as e:
         logger.error(f"List sessions failed: {e}")
-        # 返回空列表而不是 500 错误
         return {"sessions": []}
 
 
@@ -651,6 +784,39 @@ async def get_session_history(session_id: str, x_user_id: int = Header(...)):
 
 
 # ============================================================
+# 工具信息路由（新增）
+# ============================================================
+
+@app.get("/tools")
+async def list_available_tools():
+    """列出 Agent 当前可用的所有工具（本地 + MCP）"""
+    tools_info = []
+
+    # 本地 Function Calling 工具
+    local_tool_names = ["search_knowledge", "add_knowledge", "calculator"]
+    for name in local_tool_names:
+        tools_info.append({
+            "name": name,
+            "source": "local_function_calling",
+            "description": {
+                "search_knowledge": "搜索用户知识库（混合检索）",
+                "add_knowledge": "添加知识到用户知识库",
+                "calculator": "数学计算器",
+            }.get(name, ""),
+        })
+
+    # MCP 工具
+    for tool in mcp_manager.mcp_tools:
+        tools_info.append({
+            "name": tool.name,
+            "source": "mcp",
+            "description": tool.description or "",
+        })
+
+    return {"tools": tools_info, "total": len(tools_info)}
+
+
+# ============================================================
 # 健康检查
 # ============================================================
 
@@ -658,12 +824,15 @@ async def get_session_history(session_id: str, x_user_id: int = Header(...)):
 async def health_check():
     """健康检查"""
     redis_ok = await redis_client.ping()
+    mcp_tool_count = len(mcp_manager.mcp_tools)
     return {
         "status": "healthy" if redis_ok else "degraded",
         "service": "agent_qa",
-        "version": "3.0.0",
-        "mode": "react_agent",
+        "version": "5.0.0",
+        "mode": "react_function_calling_mcp",
         "redis": "connected" if redis_ok else "disconnected",
+        "mcp_tools": mcp_tool_count,
+        "architecture": "ReAct Prompt + Function Calling + MCP",
     }
 
 
